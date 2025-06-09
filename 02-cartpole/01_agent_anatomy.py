@@ -1,6 +1,7 @@
 import random
 from typing import List
 
+"""Illustrates a dumb agent and environment that interact in a SARSA manner doing nothing useful."""
 
 class Environment:
     def __init__(self):
@@ -31,6 +32,7 @@ class Agent:
         self.total_reward = 0.0
 
     def step(self, env: Environment):
+        # performs one time step's worth of work
         current_obs = env.get_observation()
         actions = env.get_actions()
         reward = env.action(random.choice(actions))
