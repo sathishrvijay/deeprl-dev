@@ -7,15 +7,19 @@ class Environment:
         self.steps_left = 10
 
     def get_observation(self) -> List[float]:
+        # Return the current env. observation back to the agent
         return [0.0, 0.0, 0.0]
 
     def get_actions(self) -> List[int]:
+        # Allows the agent to query the set of actions it can execute
         return [0, 1]
 
     def is_done(self) -> bool:
+        # signals the end of the episode to the agent
         return self.steps_left == 0
 
     def action(self, action: int) -> float:
+        # executes the agent's action and returns the reward
         if self.is_done():
             raise Exception("Game is over")
         self.steps_left -= 1
