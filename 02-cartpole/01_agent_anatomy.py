@@ -1,0 +1,49 @@
+import random
+from typing import List
+
+"""Illustrates a dumb agent and environment that interact in a SARSA manner doing nothing useful."""
+
+class Environment:
+    def __init__(self):
+        self.steps_left = 10
+
+    def get_observation(self) -> List[float]:
+        # Return the current env. observation back to the agent
+        return [0.0, 0.0, 0.0]
+
+    def get_actions(self) -> List[int]:
+        # Allows the agent to query the set of actions it can execute
+        return [0, 1]
+
+    def is_done(self) -> bool:
+        # signals the end of the episode to the agent
+        return self.steps_left == 0
+
+    def action(self, action: int) -> float:
+        # executes the agent's action and returns the reward
+        if self.is_done():
+            raise Exception("Game is over")
+        self.steps_left -= 1
+        return random.random()
+
+
+class Agent:
+    def __init__(self):
+        self.total_reward = 0.0
+
+    def step(self, env: Environment):
+        # performs one time step's worth of work
+        current_obs = env.get_observation()
+        actions = env.get_actions()
+        reward = env.action(random.choice(actions))
+        self.total_reward += reward
+
+
+if __name__ == "__main__":
+    env = Environment()
+    agent = Agent()
+
+    while not env.is_done():
+        agent.step(env)
+
+    print("Total reward got: %.4f" % agent.total_reward)
