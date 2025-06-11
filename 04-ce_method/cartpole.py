@@ -1,6 +1,4 @@
 #!/usr/bin/env python3.11
-import enum
-import typing as tt
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -77,8 +75,9 @@ def core_training_loop(
     action_labels_v,
     iter_no: int
     ):
-    """Note that there are no mini-batches, we generate a batch, then train in a loop until we reach
-    the exit condition of agent passing the test!"""
+    """Note that there are no mini-batches, a batch gets generated from agent's experience
+    with the current policy, then trained on the batch.
+    This process is repeated in a loop until the termination condition is reached."""
     objective = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
 
@@ -87,22 +86,34 @@ def core_training_loop(
     loss_v = objective(action_logits_v, action_labels_v)
     loss_v.backward()
     optimizer.step()
-    # print("%d: loss=%.3f, reward_mean=%.1f, rw_bound=%.1f" % (
-    #             iter_no, loss_v.item(), reward_m, reward_b))
-    print("%d: loss=%.3f" % (iter_no, loss_v.item()))
+    return loss_v.item()
 
 
-def unpack_batch(batch: []):
+def unpack_batch(batch: [], prune_batch=False):
     """Takes a batch of episodes in the replay buffer and converts to tensors of observation, actions
     and rewards for training
-    - Recall that each episode is an episode return and a sequence of steps which itself is a (obs, action) tuple
+    - Recall that each episode is an episode return and a sequence of steps which
+    itself is a (obs, action) tuple
+    - Note that the word 'batch' is overloaded since a batch of episodes is different from a batch of
+    (obs, action) tuples used for training the NN
     """
     obs = []
     action = []
     returns = []
+    return_mean = 0
+    return_bound = np.NaN
+
+    returns.extend([ep.episode_return for ep in batch])
+    # print(f"returns array: {returns}")
+    # mean is recorded for batch BEFORE pruning action
+    return_mean = np.mean(returns)
+    if prune_batch:
+        return_bound = np.percentile(returns, PRUNE_PERCENTILE)
+
+
     for idx, episode in enumerate(batch):
-        # print(f"Episode {idx}:")
-        returns.extend([episode.episode_return])
+        if prune_batch and episode.episode_return < return_bound:
+            continue
         obs.extend([step.obs for step in episode.steps])
         action.extend([step.action for step in episode.steps])
 
@@ -115,7 +126,7 @@ def unpack_batch(batch: []):
     # print(f"returns shape: {len(returns)}")
     # print(f"Obs: {obs_v.shape}")
     # print(f"actions: {action_v.shape}")
-    return obs_v, action_v, returns
+    return obs_v, action_v, return_bound, return_mean
 
 
 if __name__ == "__main__":
@@ -125,25 +136,17 @@ if __name__ == "__main__":
     # print(f"n_actions: {n_actions}")
 
     agent_nn = AgentNet(OBS_DIM, HIDDEN_LAYER_DIM, n_actions)
-    # print(agent_nn.forward(torch.rand(4)))
-
-    # count = 0
-    # while count < 5:
-    #     print(count)
-    #     print()
-    #     batch = generate_episodes(env, agent_nn, BATCH_SIZE)
-    #     #print(f"batch_size: {len(batch)}; Eps 1: {batch[1]}")
-    #     # for iter_no, batch in enumerate(batch):
-    #     #    print(batch)
-    #     count += 1
-
-    # Remaining steps TODO 06/10/2025
-    # prune episodes
-    # Track performance in TensorBoard to visualize
-    # Add termination condition when agent completes training
+    # print(agent_nn(torch.rand(4)))
 
     for iter_no, batch in enumerate(generate_episodes(env, agent_nn, BATCH_SIZE)):
-        obs_v, action_v, rewards = unpack_batch(batch)
-        core_training_loop(env, agent_nn, obs_v, action_v, iter_no)
-        if iter_no == 100:
+        obs_v, action_v, return_bound, return_mean = unpack_batch(batch, prune_batch=True)
+        loss = core_training_loop(env, agent_nn, obs_v, action_v, iter_no)
+        print("%d: loss=%.3f, reward_mean=%.1f, return_bound=%.1f" % (
+                    iter_no, loss, return_mean, return_bound))
+
+        if iter_no == 300:
+            print(f"Maximum number of training iterations ({iter_no}) reached!")
+            break
+        elif return_mean > 475:
+            print(f"Agent has succeeded in balancing cartpole as of ({iter_no}) training iterations!")
             break
