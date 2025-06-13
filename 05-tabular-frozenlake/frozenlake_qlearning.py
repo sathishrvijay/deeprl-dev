@@ -23,8 +23,8 @@ Instead of v(s), we now store q(s, a) in Q-learning
 #RL_ENV = "FrozenLake-v1"   # default is the simple 4x4
 RL_ENV = "FrozenLake8x8-v1"
 GAMMA = 0.9
-NUM_STEPS_PER_RANDOM_PLAY = 1000
-MAX_EPOCHS = 500   # total number of epochs to collect experience/train/test on
+NUM_STEPS_PER_RANDOM_PLAY = 500
+MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
 NUM_TRIALS = 20    # trials per epoch to determine if agent succeeded
 
 State = int
@@ -94,7 +94,7 @@ class Agent:
         return action_value
 
     def select_optimal_action(self, state: State) -> Action:
-        """return argmax_a of AVF"""
+        """return argmax_a of AVF. Trivial because Q(s, a) now exists"""
         opt_action, opt_return = None, None
 
         for action in range(self.env.action_space.n):

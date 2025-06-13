@@ -22,8 +22,8 @@ Data structures we need for VF based Tabular Learning
 #RL_ENV = "FrozenLake-v1"   # default is the simple 4x4
 RL_ENV = "FrozenLake8x8-v1"
 GAMMA = 0.9
-NUM_STEPS_PER_RANDOM_PLAY = 1000
-MAX_EPOCHS = 500   # total number of epochs to collect experience/train/test on
+NUM_STEPS_PER_RANDOM_PLAY = 500
+MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
 NUM_TRIALS = 20    # trials per epoch to determine if agent succeeded
 
 State = int
