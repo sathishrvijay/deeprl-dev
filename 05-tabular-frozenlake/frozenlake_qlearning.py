@@ -1,12 +1,12 @@
 import gymnasium as gym
-
 from torch.utils.tensorboard.writer import SummaryWriter
+import numpy as np
 
 from collections import defaultdict, Counter
 import typing as tt
 
 
-"""Tabular Offline sync DP Value Iteration method to solve the 4x4 Frozen Lake problem
+"""Tabular Offline sync DP Value Iteration method to solve the Frozen Lake problem
 with stochastic slipping, a problem that CE method struggled with due to sparse rewards and
 stochastic state transitions
 Note: Experience collection is decoupled from training (classic VE) is decoupled from agent eval
@@ -15,7 +15,8 @@ Note: We will init the env within the agent class as is typical
 Data structures we need for VF based Tabular Learning
 * s, a -> list(s', count)   due to stochastic transitions
 * s, a, s' -> r   reward matrix
-* v(s) -> estimated value
+Instead of v(s), we now store q(s, a) in Q-learning
+* q(s, a) -> estimated action values
 
 """
 
@@ -39,7 +40,8 @@ class Agent:
         self.rewards_table: tt.Dict[RewardKey, float] = defaultdict(float)
         # transit counts implemented as a nested dict for easy iteration thru next states
         self.transit_counts_table: tt.Dict[TransitKey, Counter] = defaultdict(Counter)
-        self.values_table: tt.Dict[State, float] = defaultdict(float)
+        #self.values_table: tt.Dict[State, float] = defaultdict(float)
+        self.action_values_table: tt.Dict[TransitKey, float] = defaultdict(float)
 
     def play_n_random_steps(self, n: int):
         """Note that random play is fully decoupled from agent (policy) because the goal is to
@@ -84,19 +86,19 @@ class Agent:
             rewards_key = (state, action, next_state)
             reward = self.rewards_table[rewards_key]
             count_transits = self.transit_counts_table[transit_key][next_state]
-            sars_return = reward + GAMMA * self.values_table[next_state]
-            action_value += count_transits / total_count_transits * sars_return
+            # SARS return in VF changes to SARSOpt(A) aka Q-learning return in AVF
+            opt_action = self.select_optimal_action(next_state)
+            q_return = reward + GAMMA * self.action_values_table[(next_state, opt_action)]
+            action_value += count_transits / total_count_transits * q_return
 
         return action_value
 
     def select_optimal_action(self, state: State) -> Action:
-        """return argmax_a of AVF. However, since AVF is not stored, we need to do a one step
-        lookahead search for all possible actions from current state to determine best action"""
-        opt_action = None
-        opt_return = None
+        """return argmax_a of AVF"""
+        opt_action, opt_return = None, None
 
         for action in range(self.env.action_space.n):
-            est_return = self.calc_action_value(state, action)
+            est_return = self.action_values_table[(state, action)]
             if opt_action is None or est_return > opt_return:
                 opt_action = action
                 opt_return = est_return
@@ -121,12 +123,11 @@ class Agent:
         return total_reward
 
     def value_iteration(self):
-        """Recall that V*(s) = max_a Q*(s, a). Also recall that in classic VI, we perform exactly
-        one sweep of the state space"""
+        """Sweep through every (s, a) pair in Q-learning"""
         for state in range(self.env.observation_space.n):
-            action_values = [self.calc_action_value(state, action) for action
-                in range(self.env.action_space.n)]
-            self.values_table[state] = max(action_values)
+            for action in range(self.env.action_space.n):
+                action_value = self.calc_action_value(state, action)
+                self.action_values_table[(state, action)] = action_value
 
 
 if __name__ == '__main__':
