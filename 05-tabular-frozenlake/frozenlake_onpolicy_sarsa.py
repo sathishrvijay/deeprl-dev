@@ -1,6 +1,5 @@
 import gymnasium as gym
 from torch.utils.tensorboard.writer import SummaryWriter
-import numpy as np
 
 from collections import defaultdict, Counter
 import typing as tt
@@ -19,16 +18,15 @@ Data structures we need for VF based Tabular Learning
 * q(s, a) -> estimated action values
 """
 
-#RL_ENV = "FrozenLake-v1"   # default is the simple 4x4
-RL_ENV = "FrozenLake8x8-v1"
+RL_ENV = "FrozenLake-v1"   # default is the simple 4x4
+#RL_ENV = "FrozenLake8x8-v1"
 GAMMA = 0.9
 ALPHA = 0.1
-EPSILON = 0.5
+MIN_EPSILON = 0.01
+EPSILON_DECAY_RATE = 0.995
 MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
 NUM_GPI_ITERS = 5000   # Number of GPI iterations before trial
 NUM_TRIALS = 100    # trials per epoch to determine if agent succeeded
-
-
 RANDOM_SEED = 12345
 
 State = int
@@ -39,10 +37,10 @@ RewardKey = tt.Tuple[State, Action, State]
 class Agent:
     def __init__(self):
         #self.env = gym.make(RL_ENV)
-        self.env = gym.make(RL_ENV, is_slippery=False)
+        self.env = gym.make(RL_ENV, is_slippery=True)
         self.state = None
         self.action = None
-        self.eps = EPSILON
+        self.eps = 1.0
 
         self.action_values_table: tt.Dict[TransitKey, float] = defaultdict(float)
 
@@ -54,22 +52,27 @@ class Agent:
         self.state, _ = self.env.reset()
         self.action = self.select_action(self.state)
 
+    def get_best_action_and_value(self, state: State) -> tt.Tuple:
+        opt_action, opt_value = None, None
+        for action in range(self.env.action_space.n):
+            transit_key = (state, action)
+            est_value = self.action_values_table[transit_key]
+            if opt_action is None or est_value > opt_value:
+                opt_action = action
+                opt_value = est_value
+        return (opt_action, opt_value)
+
 
     def select_action(self, state: State) -> Action:
         """Uses epsilon greedy to select the optimal action.
         returns argmax_a of AVF if not random sampling. Trivial because Q(s, a) now exists"""
-        opt_action, opt_return = None, None
+
 
 
         if random.random() <= self.eps:
-            opt_action = self.env.action_space.sample()
+            return self.env.action_space.sample()
         else:
-            for action in range(self.env.action_space.n):
-                transit_key = (state, action)
-                est_return = self.action_values_table[transit_key]
-                if opt_action is None or est_return > opt_return:
-                    opt_action = action
-                    opt_return = est_return
+            (opt_action, _) = self.get_best_action_and_value(state)
         return opt_action
 
     def play_trial_episode(self, env: gym.Env) -> float:
@@ -121,17 +124,26 @@ class Agent:
 if __name__ == '__main__':
     random.seed(RANDOM_SEED)
     agent = Agent()
+    current_eps = agent.eps
     # writer = SummaryWriter(comment="-sarsa")
 
     # For trials
-    test_env = gym.make(RL_ENV, is_slippery=False)
+    test_env = gym.make(RL_ENV, is_slippery=True)
 
     for iter_no in range(MAX_EPOCHS):
-        # print(f"iter: {iter_no}")
-        agent.eps = EPSILON  # reset to explore during training
+        agent.eps = max(MIN_EPSILON, current_eps * EPSILON_DECAY_RATE)
+
+        # Periodically check Optimal Policy
+        if iter_no % 50 == 0:
+            print(f"epoch {iter_no}: Current eps={agent.eps:.3f} - ")
+            for state in range(agent.env.observation_space.n):
+                opt_action, opt_value = agent.get_best_action_and_value(state)
+                print(f"State {state}: Best Action {opt_action}, Q-values: {opt_value}")
+
         for _ in range(NUM_GPI_ITERS):
             agent.sarsa_gpi()
 
+        current_eps = agent.eps
         agent.eps = 0.0  # deterministic play during trial
         avg_return = 0.0
         for _ in range(NUM_TRIALS):
