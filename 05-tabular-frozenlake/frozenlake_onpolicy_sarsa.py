@@ -62,13 +62,9 @@ class Agent:
                 opt_value = est_value
         return (opt_action, opt_value)
 
-
     def select_action(self, state: State) -> Action:
         """Uses epsilon greedy to select the optimal action.
         returns argmax_a of AVF if not random sampling. Trivial because Q(s, a) now exists"""
-
-
-
         if random.random() <= self.eps:
             return self.env.action_space.sample()
         else:
