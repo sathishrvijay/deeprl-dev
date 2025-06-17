@@ -18,9 +18,9 @@ Data structures we need for VF based Tabular Learning
 * q(s, a) -> estimated action values
 """
 
-RL_ENV = "FrozenLake-v1"   # default is the simple 4x4
-#RL_ENV = "FrozenLake8x8-v1"
-GAMMA = 0.9
+#RL_ENV = "FrozenLake-v1"   # default is the simple 4x4
+RL_ENV = "FrozenLake8x8-v1"
+GAMMA = 0.99
 ALPHA = 0.1
 MIN_EPSILON = 0.01
 EPSILON_DECAY_RATE = 0.995
@@ -101,7 +101,7 @@ class Agent:
         tkey = (self.state, self.action)
         tkey_next = (next_state, next_action)
         old_q = self.action_values_table[tkey]
-        target_return = reward + GAMMA * self.action_values_table[tkey_next]
+        target_return = reward + GAMMA * float(not is_done) * self.action_values_table[tkey_next]
         new_q = old_q + ALPHA * (target_return - old_q)
         self.action_values_table[tkey] = new_q
 
