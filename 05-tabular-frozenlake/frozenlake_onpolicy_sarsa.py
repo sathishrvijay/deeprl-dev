@@ -32,7 +32,6 @@ RANDOM_SEED = 12345
 State = int
 Action = int
 TransitKey = tt.Tuple[State, Action]
-RewardKey = tt.Tuple[State, Action, State]
 
 class Agent:
     def __init__(self):
