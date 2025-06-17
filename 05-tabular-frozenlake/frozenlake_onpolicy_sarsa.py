@@ -62,10 +62,10 @@ class Agent:
                 opt_value = est_value
         return (opt_action, opt_value)
 
-    def select_action(self, state: State) -> Action:
+    def select_action(self, state: State, explore=True) -> Action:
         """Uses epsilon greedy to select the optimal action.
         returns argmax_a of AVF if not random sampling. Trivial because Q(s, a) now exists"""
-        if random.random() <= self.eps:
+        if explore and random.random() <= self.eps:
             return self.env.action_space.sample()
         else:
             (opt_action, _) = self.get_best_action_and_value(state)
@@ -80,7 +80,7 @@ class Agent:
 
         total_reward: Counter = 0
         while True:
-            action = self.select_action(state)
+            action = self.select_action(state, explore=False)
             next_state, reward, is_done, is_trunc, _ = env.step(action)
             total_reward += reward
 
@@ -120,14 +120,13 @@ class Agent:
 if __name__ == '__main__':
     random.seed(RANDOM_SEED)
     agent = Agent()
-    current_eps = agent.eps
     # writer = SummaryWriter(comment="-sarsa")
 
     # For trials
     test_env = gym.make(RL_ENV, is_slippery=True)
 
     for iter_no in range(MAX_EPOCHS):
-        agent.eps = max(MIN_EPSILON, current_eps * EPSILON_DECAY_RATE)
+        agent.eps = max(MIN_EPSILON, agent.eps * EPSILON_DECAY_RATE)
 
         # Periodically check Optimal Policy
         if iter_no % 50 == 0:
@@ -139,8 +138,6 @@ if __name__ == '__main__':
         for _ in range(NUM_GPI_ITERS):
             agent.sarsa_gpi()
 
-        current_eps = agent.eps
-        agent.eps = 0.0  # deterministic play during trial
         avg_return = 0.0
         for _ in range(NUM_TRIALS):
             avg_return += agent.play_trial_episode(test_env)
