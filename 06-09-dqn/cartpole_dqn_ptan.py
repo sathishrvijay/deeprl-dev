@@ -3,6 +3,7 @@ import ptan
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
 
 import typing as tt
 
@@ -22,7 +23,7 @@ OBS_DIM = 4
 HIDDEN_LAYER_DIM = 128
 N_ACTIONS = 2
 GAMMA = 0.99
-ALPHA = 1e-3
+ALPHA = 0.1
 MIN_EPSILON = 0.01
 EPSILON_DECAY_RATE = 0.995
 MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
@@ -68,11 +69,11 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
             last_states.append(exp.last_state)
         done_masks.append(exp.last_state is None)
 
-    # Array stacking should work by default
-    #states_v = torch.as_tensor(np.stack(states))
-    #last_states_v = torch.as_tensor(np.stack(last_states))
-    states_v, actions_v, rewards_v, last_states_v = \
-        torch.tensor(states), torch.tensor(actions), torch.tensor(rewards), torch.tensor(last_states)
+    # Array stacking during conv should work by default, but direct conversion from list of numpy array
+    # to tensor is very slow, hence the np.stack(...)
+    actions_v, rewards_v = torch.tensor(actions), torch.tensor(rewards)
+    states_v, last_states_v = \
+        torch.tensor(np.stack(states)), torch.tensor(np.stack(last_states))
 
     last_state_q_v = target_net(last_states_v)
     # Note: extract max Q per obs (hence dim=1); [0] is because function returns arrays of values and
