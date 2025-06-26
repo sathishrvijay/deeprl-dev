@@ -19,14 +19,11 @@ This will implement DQN w/
 """
 
 # HPARAMS
-OBS_DIM = 4
 HIDDEN_LAYER_DIM = 128
-N_ACTIONS = 2
 GAMMA = 0.99
 ALPHA = 0.1
 MIN_EPSILON = 0.01
 EPSILON_DECAY_RATE = 0.995
-MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
 
 BATCH_SIZE = 16
 REPLAY_BUFFER_SIZE = 1000
