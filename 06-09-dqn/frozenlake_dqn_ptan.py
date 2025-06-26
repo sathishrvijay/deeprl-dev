@@ -24,11 +24,11 @@ HIDDEN_LAYER_DIM = 128
 GAMMA = 0.99
 ALPHA = 0.01
 MIN_EPSILON = 0.01
-EPSILON_DECAY_RATE = 0.9995
+EPSILON_DECAY_RATE = 0.995
 MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
 
 BATCH_SIZE = 16
-REPLAY_BUFFER_SIZE = 1000
+REPLAY_BUFFER_SIZE = 10000
 TGT_NET_SYNC = 20   # sync every 20 steps
 
 class AgentNet(nn.Module):
@@ -175,10 +175,11 @@ if __name__ == "__main__":
     optimizer = optim.Adam(net.parameters(), ALPHA)
     objective = nn.functional.mse_loss
 
+    replay_buffer.populate(REPLAY_BUFFER_SIZE)
     while not solved:
         step += 1
         # breakpoint()
-        replay_buffer.populate(1000)
+        replay_buffer.populate(50)
 
         # Need to initialize replay buffer with enough experience before starting training
         if len(replay_buffer) < 2*BATCH_SIZE:
@@ -191,7 +192,7 @@ if __name__ == "__main__":
             tgt_net.sync()
 
         # Test trials to check success condition
-        average_return = play_trials(test_env, net)
+        average_return = play_trials(test_env, tgt_net.target_model)
         episode += 1
         print(f"{step}: trial iter {episode} done, avg_return={average_return:.2f}, "
                   f"epsilon={experience_action_selector.epsilon:.2f}")
