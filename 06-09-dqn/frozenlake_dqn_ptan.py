@@ -29,7 +29,8 @@ MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
 
 BATCH_SIZE = 16
 REPLAY_BUFFER_SIZE = 10000
-TGT_NET_SYNC = 20   # sync every 20 steps
+BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
+TGT_NET_SYNC_PER_ITERS = 20   # sync every 20 steps
 
 class AgentNet(nn.Module):
     def __init__(self, state_space_dim: int, h_layer_dim: int, n_actions: int):
@@ -169,17 +170,17 @@ if __name__ == "__main__":
     replay_buffer = ptan.experience.ExperienceReplayBuffer(exp_source, buffer_size=REPLAY_BUFFER_SIZE)
 
     # intialize training
-    step = 0
-    episode = 0
+    iter_no = 0
+    trial = 0
     solved = False
     optimizer = optim.Adam(net.parameters(), ALPHA)
     objective = nn.functional.mse_loss
 
     replay_buffer.populate(REPLAY_BUFFER_SIZE)
     while not solved:
-        step += 1
+        iter_no += 1
         # breakpoint()
-        replay_buffer.populate(50)
+        replay_buffer.populate(BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
 
         # Need to initialize replay buffer with enough experience before starting training
         if len(replay_buffer) < 2*BATCH_SIZE:
@@ -188,13 +189,13 @@ if __name__ == "__main__":
         core_training_loop(net, tgt_net, replay_buffer, optimizer, objective)
         experience_action_selector.epsilon *= EPSILON_DECAY_RATE
 
-        if step % TGT_NET_SYNC == 0:
+        if iter_no % TGT_NET_SYNC_PER_ITERS == 0:
             tgt_net.sync()
 
         # Test trials to check success condition
         average_return = play_trials(test_env, tgt_net.target_model)
-        episode += 1
-        print(f"{step}: trial iter {episode} done, avg_return={average_return:.2f}, "
+        trial += 1
+        print(f"{iter_no}:trial iter {trial} done, avg_return={average_return:.2f}, "
                   f"epsilon={experience_action_selector.epsilon:.2f}")
         solved = average_return > 0.8
 
