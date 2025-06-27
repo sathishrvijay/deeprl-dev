@@ -24,7 +24,7 @@ HIDDEN_LAYER_DIM = 128
 GAMMA = 0.99
 ALPHA = 3e-4
 MIN_EPSILON = 0.05
-EPSILON_DECAY_FRAMES = 20000
+EPSILON_DECAY_FRAMES = 50000
 MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
 BATCH_SIZE = 64
 
@@ -55,7 +55,7 @@ class AgentNet(nn.Module):
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
-    target_net: nn.Module,
+    target_net: ptan.agent.TargetNet,
     gamma: float):
     """Note: Since in general an experience sub-trajectory can be n-steps,
     the terminology used here is last state instead of next state.
@@ -89,10 +89,12 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
     #     print(f"we have a successful episode!")
     #     breakpoint()
 
-    last_state_q_v = target_net(last_states_v)
-    # Note: extract max Q per obs (hence dim=1); [0] is because function returns arrays of values and
-    # indices, but we only want the values
-    best_last_q_v = torch.max(last_state_q_v, dim=1)[0]
+    # Double DQN to reduce maximization bias
+    # last_state_q_v = target_net(last_states_v)
+    best_actions_v = torch.argmax(target_net.model(last_states_v), dim=1)
+    last_states_q_v = target_net.target_model(last_states_v)
+    best_last_q_v = \
+        torch.gather(last_states_q_v, dim=1, index=best_actions_v.unsqueeze(-1)).squeeze(1)
     best_last_q_v[done_masks] = 0.0
 
     return states_v, actions_v, rewards_v + gamma * best_last_q_v
@@ -100,7 +102,7 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
 def core_training_loop(
     net: nn.Module,
-    tgt_net: nn.Module,
+    tgt_net: ptan.agent.TargetNet,
     replay_buffer: ptan.experience.ExperienceReplayBuffer,
     optimizer,
     objective,
@@ -113,7 +115,7 @@ def core_training_loop(
     """
 
     batch, indices, weights  = replay_buffer.sample(BATCH_SIZE, beta=beta)
-    states_v, actions_v, target_return_v = unpack_batch(batch, tgt_net.target_model, GAMMA)
+    states_v, actions_v, target_return_v = unpack_batch(batch, tgt_net, GAMMA)
 
     optimizer.zero_grad()
     # ensure float (FrozenLake is torch.long())
