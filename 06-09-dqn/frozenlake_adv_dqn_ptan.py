@@ -23,10 +23,9 @@ RL_ENV = "FrozenLake-v1"
 HIDDEN_LAYER_DIM = 128
 GAMMA = 0.99
 ALPHA = 3e-4
-MIN_EPSILON = 0.01
-EPSILON_DECAY_RATE = 0.995
+MIN_EPSILON = 0.05
+EPSILON_DECAY_FRAMES = 20000
 MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
-
 BATCH_SIZE = 64
 
 # Priority buffer related
@@ -35,6 +34,7 @@ BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 TGT_NET_SYNC_PER_ITERS = 20   # sync every 20 steps
 PRIORITY_BUF_ALPHA = 0.6
 PRIORITY_BUF_BETA_START = 0.4
+PRIORITY_BUF_WARMUP_FRAMES = 5000
 PRIORITY_BUF_BETA_FRAMES = 20000
 
 class AgentNet(nn.Module):
@@ -165,15 +165,15 @@ if __name__ == "__main__":
     # - FrozenLake env
     # - network & target network
     # - agent policy
-    # - Replay buffer and expwrience generation
+    # - Replay buffer and experience generation
     # Core training loop
     # - Generate SARS replay buffer observations from source net
-    # - Uniform random sample minibatch from replay buffer and unpack
+    # - sample minibatch from replay buffer and unpack
     # - Compute returns from target net;
     # - Compute TD error, compute loss and backprop
-    # - Decay epsilon
+    # - Update schedules
     # - Sync target net to training net every TGT_NET_SYNC steps
-    # - Train until convergence
+    # - Simulate trials & train until convergence
 
     # setup the environment
     env = gym.make(RL_ENV, is_slippery=True)
@@ -192,9 +192,10 @@ if __name__ == "__main__":
     agent = ptan.agent.DQNAgent(net, experience_action_selector)
     exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA)
 
-    # Initialize prio buff
+    # Initialize priority replay buff
     frame_idx = 0 # used for Priority Buffer beta annealing
-    beta_start = PRIORITY_BUF_BETA_START
+    beta = beta_start = PRIORITY_BUF_BETA_START
+    # Allow warm start with uniform sampling in the beginning by setting alpha = 0.0
     replay_buffer = \
         ptan.experience.PrioritizedReplayBuffer(exp_source, buffer_size=REPLAY_BUFFER_SIZE,
             alpha=1e-5)
@@ -206,23 +207,22 @@ if __name__ == "__main__":
     solved = False
     optimizer = optim.Adam(net.parameters(), ALPHA)
     objective = nn.functional.mse_loss
+    max_return = 0.0
 
     while not solved:
         iter_no += 1
         # breakpoint()
         replay_buffer.populate(BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
-        frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
-        beta = min(1.0, beta_start + frame_idx * (1.0 - beta_start) / PRIORITY_BUF_BETA_FRAMES)
-        # Allow warm start with uniform sampling in the beginning by setting alpha = 0.0
-        if frame_idx > 5000:   # 5k frames ≈ 100 episodes on 4×4 map
-            replay_buffer.alpha = PRIORITY_BUF_ALPHA
-
-        # Need to initialize replay buffer with enough experience before starting training
-        if len(replay_buffer) < 2*BATCH_SIZE:
-            continue
-
         core_training_loop(net, tgt_net, replay_buffer, optimizer, objective, beta)
-        experience_action_selector.epsilon *= EPSILON_DECAY_RATE
+
+        # Update all the various schedules (alpha, beta, epsilon)
+        frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
+        if frame_idx > PRIORITY_BUF_WARMUP_FRAMES:   # 5k frames ≈ 100 episodes on 4×4 map
+            replay_buffer._alpha = PRIORITY_BUF_ALPHA
+        beta = min(1.0, beta_start + frame_idx * (1.0 - beta_start) / PRIORITY_BUF_BETA_FRAMES)
+        experience_action_selector.epsilon = \
+            max(MIN_EPSILON, 1.0 - float(frame_idx) / float(EPSILON_DECAY_FRAMES))
+
 
         if iter_no % TGT_NET_SYNC_PER_ITERS == 0:
             print(f"{iter_no}: frame {frame_idx}, beta={beta:.4f}")
@@ -230,9 +230,10 @@ if __name__ == "__main__":
 
         # Test trials to check success condition
         average_return = play_trials(test_env, tgt_net.target_model)
+        max_return = average_return if (max_return < average_return) else max_return
         trial += 1
-        print(f"{iter_no}:trial iter {trial} done, avg_return={average_return:.2f}, "
-                  f"epsilon={experience_action_selector.epsilon:.2f}")
+        print(f"(iter: {iter_no}, trial: {trial}) - avg_return={average_return:.2f}, max_return={max_return:.2f} "
+                  f"alpha={replay_buffer._alpha:.2f}; beta={beta:.2f}; eps={experience_action_selector.epsilon:.2f}")
         solved = average_return > 0.8
 
     if solved:
