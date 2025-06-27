@@ -18,11 +18,11 @@ This will implement advanced DQN features like
 """
 
 # HPARAMS
-# RL_ENV = "FrozenLake8x8-v1"
+#RL_ENV = "FrozenLake8x8-v1"
 RL_ENV = "FrozenLake-v1"
 HIDDEN_LAYER_DIM = 128
 GAMMA = 0.99
-ALPHA = 0.01
+ALPHA = 3e-4
 MIN_EPSILON = 0.01
 EPSILON_DECAY_RATE = 0.995
 MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
@@ -128,7 +128,7 @@ def core_training_loop(
     loss_v.backward()
     # breakpoint()
     # update the priorities in the buffer (basically TD error per obs) for current mini batch
-    td_errors_v = (target_return_v - q_v.detach()).abs()
+    td_errors_v = (target_return_v - q_v).detach().abs()
     priorities = td_errors_v.cpu().numpy() + 1e-5
     replay_buffer.update_priorities(indices, priorities)
 
@@ -176,8 +176,8 @@ if __name__ == "__main__":
     # - Train until convergence
 
     # setup the environment
-    env = gym.make(RL_ENV, is_slippery=False)
-    test_env = gym.make(RL_ENV, is_slippery=False)
+    env = gym.make(RL_ENV, is_slippery=True)
+    test_env = gym.make(RL_ENV, is_slippery=True)
 
     # setup the agent and target net
     n_states = env.observation_space.n
@@ -191,26 +191,31 @@ if __name__ == "__main__":
         ptan.actions.EpsilonGreedyActionSelector(epsilon=1.0, selector=base_action_selector)
     agent = ptan.agent.DQNAgent(net, experience_action_selector)
     exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA)
+
+    # Initialize prio buff
+    frame_idx = 0 # used for Priority Buffer beta annealing
+    beta_start = PRIORITY_BUF_BETA_START
     replay_buffer = \
         ptan.experience.PrioritizedReplayBuffer(exp_source, buffer_size=REPLAY_BUFFER_SIZE,
-            alpha=PRIORITY_BUF_ALPHA)
+            alpha=1e-5)
+    replay_buffer.populate(REPLAY_BUFFER_SIZE)
 
     # intialize training
     iter_no = 0
     trial = 0
-    frame_idx = 0 # used for Priority Buffer beta annealing
-    beta_start = PRIORITY_BUF_BETA_START
     solved = False
     optimizer = optim.Adam(net.parameters(), ALPHA)
     objective = nn.functional.mse_loss
 
-    replay_buffer.populate(REPLAY_BUFFER_SIZE)
     while not solved:
         iter_no += 1
         # breakpoint()
         replay_buffer.populate(BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
         frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
         beta = min(1.0, beta_start + frame_idx * (1.0 - beta_start) / PRIORITY_BUF_BETA_FRAMES)
+        # Allow warm start with uniform sampling in the beginning by setting alpha = 0.0
+        if frame_idx > 5000:   # 5k frames ≈ 100 episodes on 4×4 map
+            replay_buffer.alpha = PRIORITY_BUF_ALPHA
 
         # Need to initialize replay buffer with enough experience before starting training
         if len(replay_buffer) < 2*BATCH_SIZE:
