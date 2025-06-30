@@ -10,36 +10,54 @@ import typing as tt
 from models import dqn_models
 
 
-"""This is the implementation of FrozenLake RL using the PTAN wrapper libraries.
+"""This is the implementation of LunarLander RL using the PTAN wrapper libraries.
 The goal is to demonstrate how much less code we need to write with these wrappers.
 
 This will implement advanced DQN features like
-- A prioritized experience buffer to improve training convergencei
+- A prioritized experience buffer to improve training convergence
 - Double DQN to reduce maximization bias
-- Dueling DQN network
 """
 
 # HPARAMS
-#RL_ENV = "FrozenLake8x8-v1"
-RL_ENV = "FrozenLake-v1"
-HIDDEN_LAYER_DIM = 128
-HLAYER1_DIM = 32
-HLAYER2_DIM = 16
+RL_ENV = "LunarLander-v2"
+HIDDEN_LAYER_DIM = 256
+HLAYER1_DIM = 128
+HLAYER2_DIM = 64
 GAMMA = 0.99
-ALPHA = 3e-4
-MIN_EPSILON = 0.05
+ALPHA = 1e-3
+MIN_EPSILON = 0.02
 EPSILON_DECAY_FRAMES = 50000
-MAX_EPOCHS = 1000   # total number of epochs to collect experience/train/test on
-BATCH_SIZE = 64
+MAX_EPOCHS = 2000   # total number of epochs to collect experience/train/test on
+BATCH_SIZE = 32
 
 # Priority buffer related
-REPLAY_BUFFER_SIZE = 10000
-BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
-TGT_NET_SYNC_PER_ITERS = 20   # sync every 20 steps
+REPLAY_BUFFER_SIZE = 50000
+BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 10
+TGT_NET_SYNC_PER_ITERS = 100   # sync every 100 steps
 PRIORITY_BUF_ALPHA = 0.6
 PRIORITY_BUF_BETA_START = 0.4
-PRIORITY_BUF_WARMUP_FRAMES = 10000
-PRIORITY_BUF_BETA_FRAMES = 40000
+PRIORITY_BUF_WARMUP_FRAMES = 15000    # Pure uniform sampling phase
+PRIORITY_BUF_RAMP_FRAMES = 20000      # Gradual alpha increase phase
+PRIORITY_BUF_BETA_FRAMES = 60000      # Beta annealing over 60k frames
+
+
+def get_priority_alpha(frame_idx: int) -> float:
+    """Calculate priority buffer alpha with gradual ramp-up.
+
+    Phase 1 (0 to WARMUP_FRAMES): Pure uniform sampling (alpha = 0)
+    Phase 2 (WARMUP_FRAMES to WARMUP_FRAMES + RAMP_FRAMES): Gradual ramp (alpha: 0 → target)
+    Phase 3 (WARMUP_FRAMES + RAMP_FRAMES+): Full prioritization (alpha = target)
+    """
+    if frame_idx < PRIORITY_BUF_WARMUP_FRAMES:
+        # Phase 1: Pure exploration with uniform sampling
+        return 0.0
+    elif frame_idx < PRIORITY_BUF_WARMUP_FRAMES + PRIORITY_BUF_RAMP_FRAMES:
+        # Phase 2: Gradual transition to prioritized sampling
+        ramp_progress = (frame_idx - PRIORITY_BUF_WARMUP_FRAMES) / PRIORITY_BUF_RAMP_FRAMES
+        return ramp_progress * PRIORITY_BUF_ALPHA
+    else:
+        # Phase 3: Full prioritization
+        return PRIORITY_BUF_ALPHA
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -68,9 +86,9 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
     # Array stacking during conv should work by default, but direct conversion from list of numpy array
     # to tensor is very slow, hence the np.stack(...)
-    actions_v, rewards_v = torch.tensor(actions), torch.tensor(rewards)
+    actions_v, rewards_v = torch.tensor(actions), torch.tensor(rewards, dtype=torch.float32)
     states_v, last_states_v = \
-        torch.tensor(np.stack(states)), torch.tensor(np.stack(last_states))
+        torch.tensor(np.stack(states), dtype=torch.float32), torch.tensor(np.stack(last_states), dtype=torch.float32)
 
     # Debug
     # if torch.max(rewards_v) == 1.0:
@@ -106,7 +124,7 @@ def core_training_loop(
     states_v, actions_v, target_return_v = unpack_batch(batch, tgt_net, GAMMA)
 
     optimizer.zero_grad()
-    # ensure float (FrozenLake is torch.long())
+    # ensure float32 for continuous state spaces like LunarLander
     q_v = net(states_v)
     # Note: gather the Q values for the correponding actions for each obs
     q_v = q_v.gather(dim=1, index=actions_v.unsqueeze(-1)).squeeze(-1)
@@ -130,14 +148,14 @@ def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     We use a deterministic agent that makes the optimal moves during episode play w/o exploration
     because training is independent and already exploratory
     """
-    _, _ = env.reset()
+    _, _ = test_env.reset()  # Use test_env instead of env
     base_action_selector = ptan.actions.ArgmaxActionSelector()
     agent = ptan.agent.DQNAgent(net, base_action_selector)
     exp_source = ptan.experience.ExperienceSourceFirstLast(test_env, agent, gamma=GAMMA)
     reward = 0.0
     episode_count = 0
     exp_iterator = iter(exp_source)
-    while episode_count < 20:
+    while episode_count < 10:  # Reduced from 20 to 10 for faster evaluation
         while True:
             exp = next(exp_iterator)
             reward += exp.reward
@@ -152,7 +170,7 @@ def play_trials(test_env: gym.Env, net: nn.Module) -> float:
 
 if __name__ == "__main__":
     # instantiate key elements
-    # - FrozenLake env
+    # - LunarLander env
     # - network & target network
     # - agent policy
     # - Replay buffer and experience generation
@@ -166,11 +184,11 @@ if __name__ == "__main__":
     # - Simulate trials & train until convergence
 
     # setup the environment
-    env = gym.make(RL_ENV, is_slippery=True)
-    test_env = gym.make(RL_ENV, is_slippery=True)
+    env = gym.make(RL_ENV)
+    test_env = gym.make(RL_ENV)
 
     # setup the agent and target net
-    n_states = env.observation_space.n
+    n_states = env.observation_space.shape[0]  # LunarLander has Box(8,) observation space
     n_actions = env.action_space.n
     # net = dqn_models.DQNOneHL(n_states, HIDDEN_LAYER_DIM, n_actions)
     net = dqn_models.DQNTwoHL(n_states, HLAYER1_DIM, HLAYER2_DIM, n_actions)
@@ -183,10 +201,13 @@ if __name__ == "__main__":
     agent = ptan.agent.DQNAgent(net, experience_action_selector)
     exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA)
 
-    # Initialize priority replay buff
+    # Initialize priority replay buffer with gradual alpha ramp
+    # Phase 1 (0-15k frames): Pure uniform sampling (alpha=0, eps=1.0→0.7)
+    # Phase 2 (15k-35k frames): Gradual prioritization (alpha=0→0.6, eps=0.7→0.3)
+    # Phase 3 (35k+ frames): Full prioritization (alpha=0.6, eps=0.3→0.02)
     frame_idx = 0 # used for Priority Buffer beta annealing
     beta = beta_start = PRIORITY_BUF_BETA_START
-    # Allow warm start with uniform sampling in the beginning by setting alpha = 0.0
+    # Start with minimal alpha for uniform sampling
     replay_buffer = \
         ptan.experience.PrioritizedReplayBuffer(exp_source, buffer_size=REPLAY_BUFFER_SIZE,
             alpha=1e-5)
@@ -198,7 +219,7 @@ if __name__ == "__main__":
     solved = False
     optimizer = optim.Adam(net.parameters(), ALPHA)
     objective = nn.functional.mse_loss
-    max_return = 0.0
+    max_return = -1000.0
 
     while not solved:
         iter_no += 1
@@ -208,15 +229,21 @@ if __name__ == "__main__":
 
         # Update all the various schedules (alpha, beta, epsilon)
         frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
-        if frame_idx > PRIORITY_BUF_WARMUP_FRAMES:   # 5k frames ≈ 100 episodes on 4×4 map
-            replay_buffer._alpha = PRIORITY_BUF_ALPHA
+
+        # Gradual alpha ramp instead of binary warmup
+        current_alpha = get_priority_alpha(frame_idx)
+        replay_buffer._alpha = current_alpha
+
+        # Beta annealing for importance sampling correction
         beta = min(1.0, beta_start + frame_idx * (1.0 - beta_start) / PRIORITY_BUF_BETA_FRAMES)
+
+        # Epsilon decay for exploration
         experience_action_selector.epsilon = \
             max(MIN_EPSILON, 1.0 - float(frame_idx) / float(EPSILON_DECAY_FRAMES))
 
 
         if iter_no % TGT_NET_SYNC_PER_ITERS == 0:
-            print(f"{iter_no}: frame {frame_idx}, beta={beta:.4f}")
+            print(f"{iter_no}: frame {frame_idx}, alpha={current_alpha:.4f}, beta={beta:.4f}")
             tgt_net.sync()
 
         # Test trials to check success condition
@@ -224,8 +251,8 @@ if __name__ == "__main__":
         max_return = average_return if (max_return < average_return) else max_return
         trial += 1
         print(f"(iter: {iter_no}, trial: {trial}) - avg_return={average_return:.2f}, max_return={max_return:.2f} "
-                  f"alpha={replay_buffer._alpha:.2f}; beta={beta:.2f}; eps={experience_action_selector.epsilon:.2f}")
-        solved = average_return > 0.8
+                  f"alpha={current_alpha:.2f}; beta={beta:.2f}; eps={experience_action_selector.epsilon:.2f}")
+        solved = average_return > 200.0  # LunarLander is considered solved at 200+ average reward
 
     if solved:
         print("Whee!")
