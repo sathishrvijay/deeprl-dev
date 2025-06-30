@@ -4,10 +4,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import time
+from datetime import datetime, timedelta
 
 import typing as tt
 
 from models import dqn_models
+from utils import PerformanceTracker, print_training_header, print_final_summary
 
 
 """This is the implementation of LunarLander RL using the PTAN wrapper libraries.
@@ -24,8 +27,8 @@ HIDDEN_LAYER_DIM = 256
 HLAYER1_DIM = 128
 HLAYER2_DIM = 64
 GAMMA = 0.99
-ALPHA = 1e-3
-MIN_EPSILON = 0.02
+ALPHA = 1e-2
+MIN_EPSILON = 0.05
 EPSILON_DECAY_FRAMES = 50000
 MAX_EPOCHS = 2000   # total number of epochs to collect experience/train/test on
 BATCH_SIZE = 32
@@ -213,7 +216,7 @@ if __name__ == "__main__":
             alpha=1e-5)
     replay_buffer.populate(REPLAY_BUFFER_SIZE)
 
-    # intialize training
+    # Initialize training with performance tracking
     iter_no = 0
     trial = 0
     solved = False
@@ -221,11 +224,26 @@ if __name__ == "__main__":
     objective = nn.functional.mse_loss
     max_return = -1000.0
 
+    # Initialize performance tracker and print training header
+    perf_tracker = PerformanceTracker()
+    network_config = f"{HLAYER1_DIM}-{HLAYER2_DIM} network"
+    hyperparams = {
+        'lr': ALPHA,
+        'batch_size': BATCH_SIZE,
+        'warmup_frames': PRIORITY_BUF_WARMUP_FRAMES,
+        'ramp_frames': PRIORITY_BUF_RAMP_FRAMES
+    }
+    print_training_header(RL_ENV, network_config, hyperparams)
+
     while not solved:
         iter_no += 1
-        # breakpoint()
+        iter_start_time = time.time()
+
+        # Training step
         replay_buffer.populate(BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
         core_training_loop(net, tgt_net, replay_buffer, optimizer, objective, beta)
+
+        training_time = time.time() - iter_start_time
 
         # Update all the various schedules (alpha, beta, epsilon)
         frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
@@ -246,13 +264,40 @@ if __name__ == "__main__":
             print(f"{iter_no}: frame {frame_idx}, alpha={current_alpha:.4f}, beta={beta:.4f}")
             tgt_net.sync()
 
+            # Print periodic performance summary every 500 iterations
+            if iter_no % 500 == 0:
+                perf_tracker.print_checkpoint(iter_no, frame_idx)
+
         # Test trials to check success condition
+        eval_start_time = time.time()
         average_return = play_trials(test_env, tgt_net.target_model)
+        eval_time = time.time() - eval_start_time
+
         max_return = average_return if (max_return < average_return) else max_return
         trial += 1
-        print(f"(iter: {iter_no}, trial: {trial}) - avg_return={average_return:.2f}, max_return={max_return:.2f} "
-                  f"alpha={current_alpha:.2f}; beta={beta:.2f}; eps={experience_action_selector.epsilon:.2f}")
+
+        # Log performance metrics
+        perf_metrics = perf_tracker.log_iteration(iter_no, frame_idx, average_return, training_time)
+
+        # Enhanced logging with timing information
+        print(f"(iter: {iter_no:4d}, trial: {trial:4d}) - "
+              f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
+              f"alpha={current_alpha:.2f}, beta={beta:.2f}, eps={experience_action_selector.epsilon:.2f} | "
+              f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
+              f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m")
         solved = average_return > 200.0  # LunarLander is considered solved at 200+ average reward
 
-    if solved:
-        print("Whee!")
+    # Training completed - print comprehensive summary using utility function
+    final_summary = perf_tracker.get_summary()
+    print_final_summary(
+        solved=solved,
+        average_return=average_return,
+        target_reward=200.0,
+        final_summary=final_summary,
+        frame_idx=frame_idx,
+        current_alpha=current_alpha,
+        beta=beta,
+        epsilon=experience_action_selector.epsilon,
+        iter_no=iter_no,
+        tgt_net_sync_iters=TGT_NET_SYNC_PER_ITERS
+    )
