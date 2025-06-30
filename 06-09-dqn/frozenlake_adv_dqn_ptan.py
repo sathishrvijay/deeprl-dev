@@ -7,6 +7,8 @@ import numpy as np
 
 import typing as tt
 
+from models import dqn_models
+
 
 """This is the implementation of FrozenLake RL using the PTAN wrapper libraries.
 The goal is to demonstrate how much less code we need to write with these wrappers.
@@ -21,6 +23,8 @@ This will implement advanced DQN features like
 #RL_ENV = "FrozenLake8x8-v1"
 RL_ENV = "FrozenLake-v1"
 HIDDEN_LAYER_DIM = 128
+HLAYER1_DIM = 32
+HLAYER2_DIM = 16
 GAMMA = 0.99
 ALPHA = 3e-4
 MIN_EPSILON = 0.05
@@ -34,24 +38,8 @@ BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 TGT_NET_SYNC_PER_ITERS = 20   # sync every 20 steps
 PRIORITY_BUF_ALPHA = 0.6
 PRIORITY_BUF_BETA_START = 0.4
-PRIORITY_BUF_WARMUP_FRAMES = 5000
-PRIORITY_BUF_BETA_FRAMES = 20000
-
-class AgentNet(nn.Module):
-    def __init__(self, state_space_dim: int, h_layer_dim: int, n_actions: int):
-        super(AgentNet, self).__init__()
-        self.state_space_dim = state_space_dim
-        self.net = nn.Sequential(
-            nn.Linear(state_space_dim, h_layer_dim),
-            nn.ReLU(),
-            nn.Linear(h_layer_dim, n_actions)
-        )
-
-    def forward(self, x: torch.Tensor):
-        # FrozenLake uses discrete states, so we need to one hot encodes the states before use
-        if x.dtype == torch.long or x.dtype == torch.int:
-            x = torch.nn.functional.one_hot(x, num_classes=self.state_space_dim).float()
-        return self.net(x)
+PRIORITY_BUF_WARMUP_FRAMES = 10000
+PRIORITY_BUF_BETA_FRAMES = 40000
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -137,7 +125,7 @@ def core_training_loop(
     optimizer.step()
 
 
-def play_trials(test_env: gym.Env, net: AgentNet) -> float:
+def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     """Note that we want a separate env for trials that doesn't mess with training env.
     We use a deterministic agent that makes the optimal moves during episode play w/o exploration
     because training is independent and already exploratory
@@ -184,7 +172,8 @@ if __name__ == "__main__":
     # setup the agent and target net
     n_states = env.observation_space.n
     n_actions = env.action_space.n
-    net = AgentNet(n_states, HIDDEN_LAYER_DIM, n_actions)
+    # net = dqn_models.DQNOneHL(n_states, HIDDEN_LAYER_DIM, n_actions)
+    net = dqn_models.DQNTwoHL(n_states, HLAYER1_DIM, HLAYER2_DIM, n_actions)
     tgt_net = ptan.agent.TargetNet(net)
 
     # setup the Agent policy, experience generation and Replay buffer
