@@ -23,9 +23,13 @@ This will implement advanced DQN features like
 
 # HPARAMS
 RL_ENV = "LunarLander-v2"
+REWARD_NORMALIZATION = True
 HIDDEN_LAYER_DIM = 256
 HLAYER1_DIM = 128
 HLAYER2_DIM = 64
+# Split original layer2 between Advantage and Value function
+HLAYER2V_DIM = 16
+HLAYER2A_DIM = 48
 GAMMA = 0.99
 ALPHA = 1e-2
 MIN_EPSILON = 0.05
@@ -115,7 +119,8 @@ def core_training_loop(
     replay_buffer: ptan.experience.ExperienceReplayBuffer,
     optimizer,
     objective,
-    beta
+    beta,
+    reward_norm=True
     ):
     """Mini batches are sampled from Prioritized replay buffer according to priorities
     This is basically sampling from buffer proportional to TD errors.
@@ -134,6 +139,10 @@ def core_training_loop(
 
     # Apply IS correction to loss calculation
     weights_v = torch.tensor(weights, dtype=torch.float32)
+    # min-max reward for LunarLander is +/-200. Apply normalization
+    # to reduce TD-error variance and improve training stability and convergence
+    if reward_norm is True:
+        q_v, target_return_v = q_v/200.0, target_return_v/200.0
     loss_v = objective(q_v, target_return_v, reduction='none')
     loss_v = (loss_v * weights_v).mean()
     loss_v.backward()
@@ -231,7 +240,8 @@ if __name__ == "__main__":
         'lr': ALPHA,
         'batch_size': BATCH_SIZE,
         'warmup_frames': PRIORITY_BUF_WARMUP_FRAMES,
-        'ramp_frames': PRIORITY_BUF_RAMP_FRAMES
+        'ramp_frames': PRIORITY_BUF_RAMP_FRAMES,
+        'reward_normalization': REWARD_NORMALIZATION
     }
     print_training_header(RL_ENV, network_config, hyperparams)
 
@@ -241,7 +251,8 @@ if __name__ == "__main__":
 
         # Training step
         replay_buffer.populate(BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
-        core_training_loop(net, tgt_net, replay_buffer, optimizer, objective, beta)
+        core_training_loop(net, tgt_net, replay_buffer, optimizer, objective, beta,
+            reward_norm=REWARD_NORMALIZATION)
 
         training_time = time.time() - iter_start_time
 
