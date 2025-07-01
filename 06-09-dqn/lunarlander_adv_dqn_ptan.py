@@ -24,6 +24,7 @@ This will implement advanced DQN features like
 # HPARAMS
 RL_ENV = "LunarLander-v2"
 REWARD_NORMALIZATION = True
+DUELING_DQN = True
 HIDDEN_LAYER_DIM = 256
 HLAYER1_DIM = 128
 HLAYER2_DIM = 64
@@ -126,13 +127,14 @@ def core_training_loop(
     This is basically sampling from buffer proportional to TD errors.
     * Priorities are updated based on absolute TD errors, not the MSE loss
     * Reweight the losses to correct for sampling bias from Prio buffer
+    Note: ensure float32 for continuous state spaces like LunarLander
     """
 
     batch, indices, weights  = replay_buffer.sample(BATCH_SIZE, beta=beta)
     states_v, actions_v, target_return_v = unpack_batch(batch, tgt_net, GAMMA)
 
     optimizer.zero_grad()
-    # ensure float32 for continuous state spaces like LunarLander
+
     q_v = net(states_v)
     # Note: gather the Q values for the correponding actions for each obs
     q_v = q_v.gather(dim=1, index=actions_v.unsqueeze(-1)).squeeze(-1)
@@ -203,7 +205,11 @@ if __name__ == "__main__":
     n_states = env.observation_space.shape[0]  # LunarLander has Box(8,) observation space
     n_actions = env.action_space.n
     # net = dqn_models.DQNOneHL(n_states, HIDDEN_LAYER_DIM, n_actions)
-    net = dqn_models.DQNTwoHL(n_states, HLAYER1_DIM, HLAYER2_DIM, n_actions)
+    net = None
+    if DUELING_DQN is True:
+        net = dqn_models.DuelDQNTwoHL(n_states, HLAYER1_DIM, HLAYER2V_DIM, HLAYER2A_DIM, n_actions)
+    else:
+        net = dqn_models.DQNTwoHL(n_states, HLAYER1_DIM, HLAYER2_DIM, n_actions)
     tgt_net = ptan.agent.TargetNet(net)
 
     # setup the Agent policy, experience generation and Replay buffer
