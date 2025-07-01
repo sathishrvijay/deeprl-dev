@@ -41,7 +41,7 @@ BATCH_SIZE = 32
 # Priority buffer related
 REPLAY_BUFFER_SIZE = 50000
 BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 10
-TGT_NET_SYNC_PER_ITERS = 100   # sync every 100 steps
+TGT_NET_SYNC_PER_ITERS = 1000   # sync every 100 steps
 PRIORITY_BUF_ALPHA = 0.6
 PRIORITY_BUF_BETA_START = 0.4
 PRIORITY_BUF_WARMUP_FRAMES = 15000    # Pure uniform sampling phase
@@ -143,9 +143,9 @@ def core_training_loop(
     weights_v = torch.tensor(weights, dtype=torch.float32)
     # min-max reward for LunarLander is +/-200. Apply normalization
     # to reduce TD-error variance and improve training stability and convergence
-    if reward_norm is True:
-        q_v, target_return_v = q_v/200.0, target_return_v/200.0
-    loss_v = objective(q_v, target_return_v, reduction='none')
+    # NOTE: o3 suggests priorities should be based on raw rewards, not scaled
+    scale = 1/200.0 if reward_norm else 1.0
+    loss_v = objective(q_v * scale, target_return_v * scale, reduction='none')
     loss_v = (loss_v * weights_v).mean()
     loss_v.backward()
     # breakpoint()
@@ -217,7 +217,7 @@ if __name__ == "__main__":
     experience_action_selector = \
         ptan.actions.EpsilonGreedyActionSelector(epsilon=1.0, selector=base_action_selector)
     agent = ptan.agent.DQNAgent(net, experience_action_selector)
-    exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA)
+    exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA, steps_count=3)
 
     # Initialize priority replay buffer with gradual alpha ramp
     # Phase 1 (0-15k frames): Pure uniform sampling (alpha=0, eps=1.0→0.7)
@@ -229,7 +229,8 @@ if __name__ == "__main__":
     replay_buffer = \
         ptan.experience.PrioritizedReplayBuffer(exp_source, buffer_size=REPLAY_BUFFER_SIZE,
             alpha=1e-5)
-    replay_buffer.populate(REPLAY_BUFFER_SIZE)
+    # No need to populate buffer fully upfront
+    replay_buffer.populate(PRIORITY_BUF_WARMUP_FRAMES)
 
     # Initialize training with performance tracking
     iter_no = 0
@@ -267,7 +268,7 @@ if __name__ == "__main__":
 
         # Gradual alpha ramp instead of binary warmup
         current_alpha = get_priority_alpha(frame_idx)
-        replay_buffer._alpha = current_alpha
+        replay_buffer.alpha = current_alpha
 
         # Beta annealing for importance sampling correction
         beta = min(1.0, beta_start + frame_idx * (1.0 - beta_start) / PRIORITY_BUF_BETA_FRAMES)
@@ -278,12 +279,18 @@ if __name__ == "__main__":
 
 
         if iter_no % TGT_NET_SYNC_PER_ITERS == 0:
-            print(f"{iter_no}: frame {frame_idx}, alpha={current_alpha:.4f}, beta={beta:.4f}")
+            print(f"TARGET NET SYNC!! {iter_no}: frame {frame_idx},"
+                  f"alpha={current_alpha:.4f}, beta={beta:.4f}")
             tgt_net.sync()
 
-            # Print periodic performance summary every 500 iterations
-            if iter_no % 500 == 0:
-                perf_tracker.print_checkpoint(iter_no, frame_idx)
+        # Print periodic performance summary every 500 iterations
+        if iter_no % 500 == 0:
+            perf_tracker.print_checkpoint(iter_no, frame_idx)
+
+        # Flush out buffer and repopulate
+        if iter_no == 1000:
+            print("WARNING: RESETTING BUFFER!!")
+            replay_buffer.populate(REPLAY_BUFFER_SIZE)
 
         # Test trials to check success condition
         eval_start_time = time.time()
