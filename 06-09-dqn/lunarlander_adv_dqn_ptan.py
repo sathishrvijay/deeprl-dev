@@ -32,7 +32,7 @@ HLAYER2_DIM = 64
 HLAYER2V_DIM = 16
 HLAYER2A_DIM = 48
 GAMMA = 0.99
-ALPHA = 1e-2
+ALPHA = 3e-3
 MIN_EPSILON = 0.05
 EPSILON_DECAY_FRAMES = 50000
 MAX_EPOCHS = 2000   # total number of epochs to collect experience/train/test on
@@ -41,7 +41,7 @@ BATCH_SIZE = 32
 # Priority buffer related
 REPLAY_BUFFER_SIZE = 50000
 BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 10
-TGT_NET_SYNC_PER_ITERS = 1000   # sync every 100 steps
+TGT_NET_SYNC_PER_ITERS = 500
 PRIORITY_BUF_ALPHA = 0.6
 PRIORITY_BUF_BETA_START = 0.4
 PRIORITY_BUF_WARMUP_FRAMES = 15000    # Pure uniform sampling phase
@@ -288,7 +288,7 @@ if __name__ == "__main__":
             perf_tracker.print_checkpoint(iter_no, frame_idx)
 
         # Flush out buffer and repopulate
-        if iter_no == 1000:
+        if iter_no % 1000 == 0:
             print("WARNING: RESETTING BUFFER!!")
             replay_buffer.populate(REPLAY_BUFFER_SIZE)
 
