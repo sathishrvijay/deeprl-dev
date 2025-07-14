@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 
 class A2CDiscreteAction(nn.Module):
-    """Value and Action Proba (aka Policy) output heads with a shared backbone"""
+    """Advantage Actor-Critic Model for discrete actions.
+    Value and Action Proba (aka Policy) output heads with a shared backbone"""
     def __init__(self, state_space_dim: int, h_layer1_dim: int,
         h_layer2v_dim: int, h_layer2a_dim: int, n_actions: int):
         super(A2CDiscreteAction, self).__init__()
