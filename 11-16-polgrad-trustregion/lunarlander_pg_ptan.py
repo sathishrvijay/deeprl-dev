@@ -34,6 +34,7 @@ BATCH_SIZE = 32
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
     net: ptan.agents.AgentNet,
+    n_steps: int
     ):
     """Note: Since in general an experience sub-trajectory can be n-steps,
     the terminology used here is last state instead of next state.
@@ -67,10 +68,12 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
     #     print(f"we have a successful episode!")
     #     breakpoint()
 
-    returns_v = ...
-
-    # return SARS observations
-    return states_v, actions_v, returns_v, last_states_v
+    # return states, actions, returns
+    ls_values_v, _ = net(last_states_v)
+    ls_values_v = ls_values_v.squeeze(1).data
+    ls_values_v *= GAMMA ** n_steps
+    returns_v = rewards_v + ls_values_v
+    return states_v, actions_v, returns_v
 
 
 def core_training_loop(
@@ -180,6 +183,7 @@ if __name__ == "__main__":
         iter_start_time = time.time()
 
         # Collect experience
+        collect_experience(...)
 
         # Training step
         core_training_loop(...)
