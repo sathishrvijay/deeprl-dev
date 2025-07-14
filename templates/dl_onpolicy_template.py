@@ -33,8 +33,8 @@ BATCH_SIZE = 32
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
-    target_net: ptan.agent.TargetNet,
-    gamma: float):
+    net: ptan.agents.AgentNet,
+    ):
     """Note: Since in general an experience sub-trajectory can be n-steps,
     the terminology used here is last state instead of next state.
     Additionally, reward is equal to the cumulative discounted rewards from intermediate steps
@@ -83,16 +83,14 @@ def core_training_loop(
     """
 
     # TODO sample experience
-    states_v, actions_v, target_return_v = unpack_batch(batch, tgt_net, GAMMA)
+    states_v, actions_v, target_return_v = unpack_batch(batch, net)
 
     optimizer.zero_grad()
 
-    q_v = net(states_v)
+    values_v = net(states_v)
     # Note: gather the Q values for the correponding actions for each obs
     q_v = q_v.gather(dim=1, index=actions_v.unsqueeze(-1)).squeeze(-1)
 
-    # Apply IS correction to loss calculation
-    weights_v = torch.tensor(weights, dtype=torch.float32)
 
     loss_v = objective(q_v * scale, target_return_v * scale, reduction='none')
     loss_v = (loss_v * weights_v).mean()
@@ -133,17 +131,15 @@ def play_trials(test_env: gym.Env, net: nn.Module) -> float:
 
 if __name__ == "__main__":
     # instantiate key elements
-    # - LunarLander env
-    # - network & target network
-    # - agent policy
-    # - Replay buffer and experience generation
+    # - Setup env
+    # - network
+    # - agent class & policy
     # Core training loop
-    # - Generate SARS replay buffer observations from source net
-    # - sample minibatch from replay buffer and unpack
-    # - Compute returns from target net;
-    # - Compute TD error, compute loss and backprop
-    # - Update schedules
-    # - Sync target net to training net every TGT_NET_SYNC steps
+    # - Generate SARS observations from training net
+    # - sample minibatch and unpack
+    # - Compute returns
+    # - Compute losses and backprop
+    # - Update schedules if any
     # - Simulate trials & train until convergence
 
     # setup the environment
@@ -154,14 +150,10 @@ if __name__ == "__main__":
     n_states = env.observation_space.shape[0]  # LunarLander has Box(8,) observation space
     n_actions = env.action_space.n
     # net = dqn_models.DQNOneHL(n_states, HIDDEN_LAYER_DIM, n_actions)
-    net = None
-    if DUELING_DQN is True:
-        net = dqn_models.DuelDQNTwoHL(n_states, HLAYER1_DIM, HLAYER2V_DIM, HLAYER2A_DIM, n_actions)
-    else:
-        net = dqn_models.DQNTwoHL(n_states, HLAYER1_DIM, HLAYER2_DIM, n_actions)
-    tgt_net = ptan.agent.TargetNet(net)
+    net = ...
+    #  net = dqn_models.DQNTwoHL(n_states, HLAYER1_DIM, HLAYER2_DIM, n_actions)
 
-    # setup the Agent policy, experience generation and Replay buffer
+    # TODO: setup the Agent & policy
     base_action_selector = ptan.actions.ArgmaxActionSelector()
     experience_action_selector = \
         ptan.actions.EpsilonGreedyActionSelector(epsilon=1.0, selector=base_action_selector)
@@ -183,9 +175,6 @@ if __name__ == "__main__":
     hyperparams = {
         'lr': ALPHA,
         'batch_size': BATCH_SIZE,
-        'warmup_frames': PRIORITY_BUF_WARMUP_FRAMES,
-        'ramp_frames': PRIORITY_BUF_RAMP_FRAMES,
-        'reward_normalization': REWARD_NORMALIZATION
     }
     print_training_header(RL_ENV, network_config, hyperparams)
 
@@ -194,8 +183,7 @@ if __name__ == "__main__":
         iter_start_time = time.time()
 
         # Training step
-        core_training_loop(net, tgt_net, replay_buffer, optimizer, objective, beta,
-            reward_norm=REWARD_NORMALIZATION)
+        core_training_loop(...)
 
         training_time = time.time() - iter_start_time
 
@@ -206,23 +194,13 @@ if __name__ == "__main__":
         experience_action_selector.epsilon = \
             max(MIN_EPSILON, 1.0 - float(frame_idx) / float(EPSILON_DECAY_FRAMES))
 
-        if iter_no % TGT_NET_SYNC_PER_ITERS == 0:
-            print(f"TARGET NET SYNC!! {iter_no}: frame {frame_idx},"
-                  f"alpha={current_alpha:.4f}, beta={beta:.4f}")
-            tgt_net.sync()
-
         # Print periodic performance summary every 500 iterations
         if iter_no % 500 == 0:
             perf_tracker.print_checkpoint(iter_no, frame_idx)
 
-        # Flush out buffer and repopulate
-        if iter_no % 1000 == 0:
-            print("WARNING: RESETTING BUFFER!!")
-            replay_buffer.populate(REPLAY_BUFFER_SIZE)
-
         # Test trials to check success condition
         eval_start_time = time.time()
-        average_return = play_trials(test_env, tgt_net.target_model)
+        average_return = play_trials(...)
         eval_time = time.time() - eval_start_time
 
         max_return = average_return if (max_return < average_return) else max_return
@@ -244,12 +222,10 @@ if __name__ == "__main__":
     print_final_summary(
         solved=solved,
         average_return=average_return,
-        target_reward=200.0,
+        target_reward=<>,
         final_summary=final_summary,
         frame_idx=frame_idx,
         current_alpha=current_alpha,
-        beta=beta,
         epsilon=experience_action_selector.epsilon,
-        iter_no=iter_no,
-        tgt_net_sync_iters=TGT_NET_SYNC_PER_ITERS
+        iter_no=iter_no
     )
