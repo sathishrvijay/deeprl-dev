@@ -29,7 +29,7 @@ GAMMA = 0.99
 ALPHA = 3e-3
 MIN_EPSILON = 0.05
 MAX_EPOCHS = 2000   # total number of epochs to collect experience/train/test on
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -86,7 +86,7 @@ def core_training_loop(
     """
 
     # TODO sample experience
-    states_v, actions_v, target_return_v = unpack_batch(batch, net)
+    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_ROLLOUT_STEPS)
 
     optimizer.zero_grad()
 
@@ -156,9 +156,10 @@ if __name__ == "__main__":
         HLAYER2V_DIM, HLAYER2A_DIM, n_actions)
 
     # Setup the Agent & policy
+    # We need VectorExperience because output is action probas?
     experience_action_selector = ptan.actions.ProbabilityActionSelector()
     agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
-    exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA,
+    exp_source = ptan.experience.VectorExperienceSourceFirstLast(env, agent, gamma=GAMMA,
         steps_count=N_ROLLOUT_STEPS)
 
     # Initialize training with performance tracking
@@ -182,20 +183,16 @@ if __name__ == "__main__":
         iter_no += 1
         iter_start_time = time.time()
 
-        # Collect experience
-        collect_experience(...)
+        # Collect multiple episodes for training
+        batch = []
+        while len(batch) < BATCH_SIZE:
+            batch.append(next(exp_source))
 
         # Training step
         core_training_loop(...)
+        batch.clear()
 
         training_time = time.time() - iter_start_time
-
-        # Update all the various schedules (alpha, beta, epsilon)
-        frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
-
-        # Epsilon decay for exploration
-        experience_action_selector.epsilon = \
-            max(MIN_EPSILON, 1.0 - float(frame_idx) / float(EPSILON_DECAY_FRAMES))
 
         # Print periodic performance summary every 500 iterations
         if iter_no % 500 == 0:
