@@ -23,18 +23,20 @@ value loss, entropy bonus and advantage etc
 
 # HPARAMS
 RL_ENV = "LunarLander-v2"
-N_ENVS = 32
+N_ENVS = 16
 HIDDEN_LAYER_DIM = 256
 HLAYER1_DIM = 128
 # Split original layer2 between Advantage and Value function
 HLAYER2V_DIM = 16
 HLAYER2A_DIM = 48
-N_ROLLOUT_STEPS = 3 # Number of steps to rollout during experience collection
-GAMMA = 0.99
-ALPHA = 3e-3
-ENTROPY_BONUS_BETA = 0.01
-CLIP_GRAD = 0.5   # typical values of clipping the L2 norm is 0.1 to 1.0
-BATCH_SIZE = 128
+N_ROLLOUT_STEPS = 10 # Number of steps to rollout during experience collection
+GAMMA = 0.995
+ALPHA_START = 3e-4
+ENTROPY_BONUS_BETA = 1e-3
+CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
+BATCH_SIZE = 64
+
+LR_DECAY_EPOCHS = 400000
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -68,11 +70,6 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
     states_v, last_states_v = \
         torch.tensor(np.stack(states), dtype=torch.float32), torch.tensor(np.stack(last_states), dtype=torch.float32)
 
-    # Debug
-    # if torch.max(rewards_v) == 1.0:
-    #     print(f"we have a successful episode!")
-    #     breakpoint()
-
     # return states, actions, returns
     with torch.no_grad():
         ls_values_v, _ = net(last_states_v)
@@ -102,11 +99,13 @@ def core_training_loop(
     # loss = mse_loss + pg_gain + entropy_bonus
     critic_loss_v = nn.functional.mse_loss(values_v.squeeze(-1), target_return_v)
 
-    # Note: Very important to detach values_v since we don't want to propagate gradients
-    # from PG loss into Critic network
+    # Key notes for PG loss calc -
+    # 1. detach values_v to prevent propagating PG loss into Critic network
+    # 2. Normalize advantage for the batch (suggested by o3 to avoid learning plateaus)
+    # 3. Gather probas only for the selected actions for PG loss
+    # 4. Don't forget the negative sign for gradient ascent
     adv_v = target_return_v - values_v.squeeze(-1).detach()
-    # Note: we also only need the probas for the selected actions for PG loss
-    # Note: don't forget the negative sign for gradient ascent
+    adv_v = (adv_v - adv_v.mean()) / (adv_v.std() + 1e-8)
     log_actions_v = log_action_probas_v.gather(dim=1, index=actions_v.unsqueeze(1)).squeeze(-1)
     pg_loss_v = -(adv_v * log_actions_v).mean()
 
@@ -115,7 +114,6 @@ def core_training_loop(
 
     loss_v = critic_loss_v + pg_loss_v + entropy_bonus_v
     loss_v.backward()
-    # breakpoint()
     # Note: clip gradients beore updating network weights
     torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP_GRAD)
     optimizer.step()
@@ -124,10 +122,9 @@ def core_training_loop(
 def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     """Note that we want a separate env for trials that doesn't mess with training env.
     We might want to use a deterministic agent that makes the most probable moves for eval.
-    TODO: need to change the action selector for this
     """
     _, _ = test_env.reset()  # Use test_env instead of env
-    experience_action_selector = ptan.actions.ProbabilityActionSelector()
+    experience_action_selector = ptan.actions.ArgmaxActionSelector()
     agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
     exp_source = ptan.experience.ExperienceSourceFirstLast(test_env, agent, gamma=GAMMA)
     reward = 0.0
@@ -185,7 +182,7 @@ if __name__ == "__main__":
     iter_no = 0
     trial = 0
     solved = False
-    optimizer = optim.Adam(net.parameters(), ALPHA)
+    optimizer = optim.Adam(net.parameters(), ALPHA_START)
     objective = nn.functional.mse_loss
     max_return = -1000.0
 
@@ -199,14 +196,21 @@ if __name__ == "__main__":
     # print_training_header(RL_ENV, network_config, hyperparams)
 
     batch = []
+    exp_iterator = iter(exp_source)
+    # each iteration of exp_source yields N_ENVS experiences
+    num_exp_per_iter = BATCH_SIZE * N_ENVS
     while not solved:
         iter_no += 1
+        current_lr = ALPHA_START * max(1e-5, 1 - iter_no / LR_DECAY_EPOCHS)
+        for g in optimizer.param_groups:
+            g["lr"] = current_lr
         iter_start_time = time.time()
 
-        # Collect multiple episodes for training
-        exp_iterator = iter(exp_source)
-        while len(batch) < BATCH_SIZE:
-            batch.append(next(exp_iterator))
+        # Collect experiences from parallel envs for training
+        while len(batch) < num_exp_per_iter:
+            exp = next(exp_iterator)
+            batch.append(exp)
+
 
         # Training step
         core_training_loop(net, batch, optimizer)
@@ -231,7 +235,7 @@ if __name__ == "__main__":
         # Enhanced logging with timing information
         print(f"(iter: {iter_no:4d}, trial: {trial:4d}) - "
               f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
-
+              f"lr={current_lr:.5f}, "
               #f"alpha={current_alpha:.2f}, beta={beta:.2f}, eps={experience_action_selector.epsilon:.2f} | "
               f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
               #f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m"
