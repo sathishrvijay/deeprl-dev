@@ -19,7 +19,7 @@ PG methods like A3C, DDPG, SAC, PPO and others
 """
 
 # HPARAMS
-RL_ENV = "LunarLander-v1"
+RL_ENV = "LunarLander-v2"
 HIDDEN_LAYER_DIM = 256
 HLAYER1_DIM = 128
 # Split original layer2 between Advantage and Value function
@@ -29,13 +29,12 @@ N_ROLLOUT_STEPS = 3 # Number of steps to rollout during experience collection
 GAMMA = 0.99
 ALPHA = 3e-3
 ENTROPY_BONUS_BETA = 0.01
-MIN_EPSILON = 0.05
-MAX_EPOCHS = 2000   # total number of epochs to collect experience/train/test on
+CLIP_GRAD = 0.5   # typical values of clipping the L2 norm is 0.1 to 1.0
 BATCH_SIZE = 128
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
-    net: ptan.agent.AgentNet,
+    net: ptan.agent.NNAgent,
     n_steps: int
     ):
     """Note: Since in general an experience sub-trajectory can be n-steps,
@@ -84,20 +83,33 @@ def core_training_loop(
     optimizer
     ):
     """In A2C, the entire generated batch of episodes is used for training in every epoch.
+    Note: Actor head returns logits
     """
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_ROLLOUT_STEPS)
     optimizer.zero_grad()
     values_v, action_logits_v = net(states_v)
+    action_probas_v = nn.functional.softmax(action_logits_v, dim=1)
+    log_action_probas_v = nn.functional.log_softmax(action_logits_v, dim=1)
 
     # loss = mse_loss + pg_gain + entropy_bonus
-    critic_loss_v = nn.functional.mse_loss(values_v, target_return_v)
-    adv_v = target_return_v - values_v
-    pg_loss_v = -adv_v * action_logits_v
-    entropy_bonus_v = -ENTROPY_BONUS_BETA * torch.exp(pg_loss_v) * pg_loss_v
+    critic_loss_v = nn.functional.mse_loss(values_v.squeeze(-1), target_return_v)
+
+    # Note: Very important to detach values_v since we don't want to propagate gradients
+    # from PG loss into Critic network
+    adv_v = target_return_v - values_v.squeeze(-1).detach()
+    # Note: we also only need the probas for the selected actions for PG loss
+    # Note: don't forget the negative sign for gradient ascent
+    log_actions_v = log_action_probas_v.gather(dim=1, index=actions_v.unsqueeze(1)).squeeze(-1)
+    pg_loss_v = -(adv_v * log_actions_v).mean()
+
+    # Note: Entropy has a negative sign, but its a bonus, so double negatives cancel out
+    entropy_bonus_v = ENTROPY_BONUS_BETA * (action_probas_v * log_action_probas_v).mean()
 
     loss_v = critic_loss_v + pg_loss_v + entropy_bonus_v
     loss_v.backward()
     # breakpoint()
+    # Note: clip gradients beore updating network weights
+    torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP_GRAD)
     optimizer.step()
 
 
@@ -210,7 +222,8 @@ if __name__ == "__main__":
 
               #f"alpha={current_alpha:.2f}, beta={beta:.2f}, eps={experience_action_selector.epsilon:.2f} | "
               f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
-              f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m")
+              #f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m"
+        )
         solved = average_return > 200.0  # LunarLander is considered solved at 200+ average reward
 
     # Training completed - print comprehensive summary using utility function
