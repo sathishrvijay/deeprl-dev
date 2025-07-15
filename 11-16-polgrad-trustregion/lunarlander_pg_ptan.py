@@ -70,8 +70,11 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
     #     breakpoint()
 
     # return states, actions, returns
-    ls_values_v, _ = net(last_states_v)
+    with torch.no_grad():
+        ls_values_v, _ = net(last_states_v)
+
     ls_values_v = ls_values_v.squeeze(1).data
+    # Note: important step for computing returns correctly w/ loop unroll
     ls_values_v *= GAMMA ** n_steps
     returns_v = rewards_v + ls_values_v
     return states_v, actions_v, returns_v
@@ -162,8 +165,10 @@ if __name__ == "__main__":
         HLAYER2V_DIM, HLAYER2A_DIM, n_actions)
 
     # Setup the Agent & policy
-    # We need VectorExperience because output is action probas?
+    # TODO: We need VectorExperience for multiple environments
     experience_action_selector = ptan.actions.ProbabilityActionSelector()
+    # Note: network returns logits, so we need to apply softmax before
+    # stochastically sampling actions
     agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
     exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA,
         steps_count=N_ROLLOUT_STEPS)
