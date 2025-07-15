@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta
 
 import typing as tt
+from functools import partial
 
 from models import pgtr_models
 # from utils import PerformanceTracker, print_training_header, print_final_summary
@@ -15,11 +16,14 @@ from models import pgtr_models
 
 """This is the implementation of A2C with LunarLander-v1 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
-PG methods like A3C, DDPG, SAC, PPO and others
+PG methods like A3C, DDPG, SAC, PPO and others.
+TODO: 07/15/25 - Add overall metrics tracking as well as tracking of total loss,
+value loss, entropy bonus and advantage etc
 """
 
 # HPARAMS
 RL_ENV = "LunarLander-v2"
+N_ENVS = 32
 HIDDEN_LAYER_DIM = 256
 HLAYER1_DIM = 128
 # Split original layer2 between Advantage and Value function
@@ -88,8 +92,9 @@ def core_training_loop(
     """In A2C, the entire generated batch of episodes is used for training in every epoch.
     Note: Actor head returns logits
     """
-    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_ROLLOUT_STEPS)
     optimizer.zero_grad()
+
+    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_ROLLOUT_STEPS)
     values_v, action_logits_v = net(states_v)
     action_probas_v = nn.functional.softmax(action_logits_v, dim=1)
     log_action_probas_v = nn.functional.log_softmax(action_logits_v, dim=1)
@@ -124,7 +129,7 @@ def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     _, _ = test_env.reset()  # Use test_env instead of env
     experience_action_selector = ptan.actions.ProbabilityActionSelector()
     agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
-    exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA)
+    exp_source = ptan.experience.ExperienceSourceFirstLast(test_env, agent, gamma=GAMMA)
     reward = 0.0
     episode_count = 0
     exp_iterator = iter(exp_source)
@@ -154,13 +159,16 @@ if __name__ == "__main__":
     # - Update schedules if any
     # - Simulate trials & train until convergence
 
-    # setup the environment
-    env = gym.make(RL_ENV)
+    # setup the parallel environment collection
+    # env = gym.make(RL_ENV)
+    env_fns = [partial(gym.make, RL_ENV) for _ in range(N_ENVS)]
+    vector_env = gym.vector.SyncVectorEnv(env_fns)
+    # don't need a vectorized trial env
     test_env = gym.make(RL_ENV)
 
     # setup the agent and target net
-    n_states = env.observation_space.shape[0]  # LunarLander has Box(8,) observation space
-    n_actions = env.action_space.n
+    n_states = vector_env.single_observation_space.shape[0]  # LunarLander has Box(8,) observation space
+    n_actions = vector_env.single_action_space.n
     net = pgtr_models.A2CDiscreteAction(n_states, HLAYER1_DIM,
         HLAYER2V_DIM, HLAYER2A_DIM, n_actions)
 
@@ -170,7 +178,7 @@ if __name__ == "__main__":
     # Note: network returns logits, so we need to apply softmax before
     # stochastically sampling actions
     agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
-    exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA,
+    exp_source = ptan.experience.VectorExperienceSourceFirstLast(vector_env, agent, gamma=GAMMA,
         steps_count=N_ROLLOUT_STEPS)
 
     # Initialize training with performance tracking
@@ -190,12 +198,12 @@ if __name__ == "__main__":
     # }
     # print_training_header(RL_ENV, network_config, hyperparams)
 
+    batch = []
     while not solved:
         iter_no += 1
         iter_start_time = time.time()
 
         # Collect multiple episodes for training
-        batch = []
         exp_iterator = iter(exp_source)
         while len(batch) < BATCH_SIZE:
             batch.append(next(exp_iterator))
@@ -203,7 +211,6 @@ if __name__ == "__main__":
         # Training step
         core_training_loop(net, batch, optimizer)
         batch.clear()
-
         training_time = time.time() - iter_start_time
 
         # Print periodic performance summary every 500 iterations
