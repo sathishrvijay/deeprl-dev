@@ -10,11 +10,12 @@ from datetime import datetime, timedelta
 import typing as tt
 
 from models import pgtr_models
-from utils import PerformanceTracker, print_training_header, print_final_summary
+# from utils import PerformanceTracker, print_training_header, print_final_summary
 
 
-"""This is the implementation of <> RL using the PTAN wrapper libraries. TODO fill out
-
+"""This is the implementation of A2C with LunarLander-v1 RL using the PTAN wrapper libraries.
+A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
+PG methods like A3C, DDPG, SAC, PPO and others
 """
 
 # HPARAMS
@@ -27,13 +28,14 @@ HLAYER2A_DIM = 48
 N_ROLLOUT_STEPS = 3 # Number of steps to rollout during experience collection
 GAMMA = 0.99
 ALPHA = 3e-3
+ENTROPY_BONUS_BETA = 0.01
 MIN_EPSILON = 0.05
 MAX_EPOCHS = 2000   # total number of epochs to collect experience/train/test on
 BATCH_SIZE = 128
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
-    net: ptan.agents.AgentNet,
+    net: ptan.agent.AgentNet,
     n_steps: int
     ):
     """Note: Since in general an experience sub-trajectory can be n-steps,
@@ -78,44 +80,36 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
 def core_training_loop(
     net: nn.Module,
-    optimizer,
-    objective,
-    beta
+    batch: list,
+    optimizer
     ):
-    """Fill in
+    """In A2C, the entire generated batch of episodes is used for training in every epoch.
     """
-
-    # TODO sample experience
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_ROLLOUT_STEPS)
-
     optimizer.zero_grad()
+    values_v, action_logits_v = net(states_v)
 
-    values_v = net(states_v)
-    # Note: gather the Q values for the correponding actions for each obs
-    q_v = q_v.gather(dim=1, index=actions_v.unsqueeze(-1)).squeeze(-1)
+    # loss = mse_loss + pg_gain + entropy_bonus
+    critic_loss_v = nn.functional.mse_loss(values_v, target_return_v)
+    adv_v = target_return_v - values_v
+    pg_loss_v = -adv_v * action_logits_v
+    entropy_bonus_v = -ENTROPY_BONUS_BETA * torch.exp(pg_loss_v) * pg_loss_v
 
-
-    loss_v = objective(q_v * scale, target_return_v * scale, reduction='none')
-    loss_v = (loss_v * weights_v).mean()
+    loss_v = critic_loss_v + pg_loss_v + entropy_bonus_v
     loss_v.backward()
     # breakpoint()
-    # update the priorities in the buffer (basically TD error per obs) for current mini batch
-    td_errors_v = (target_return_v - q_v).detach().abs()
-    priorities = td_errors_v.cpu().numpy() + 1e-5
-    replay_buffer.update_priorities(indices, priorities)
-
     optimizer.step()
 
 
 def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     """Note that we want a separate env for trials that doesn't mess with training env.
-    We use a deterministic agent that makes the optimal moves during episode play w/o exploration
-    because training is independent and already exploratory
+    We might want to use a deterministic agent that makes the most probable moves for eval.
+    TODO: need to change the action selector for this
     """
     _, _ = test_env.reset()  # Use test_env instead of env
-    base_action_selector = ptan.actions.ArgmaxActionSelector()
-    agent = ptan.agent.DQNAgent(net, base_action_selector)
-    exp_source = ptan.experience.ExperienceSourceFirstLast(test_env, agent, gamma=GAMMA)
+    experience_action_selector = ptan.actions.ProbabilityActionSelector()
+    agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
+    exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA)
     reward = 0.0
     episode_count = 0
     exp_iterator = iter(exp_source)
@@ -159,7 +153,7 @@ if __name__ == "__main__":
     # We need VectorExperience because output is action probas?
     experience_action_selector = ptan.actions.ProbabilityActionSelector()
     agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
-    exp_source = ptan.experience.VectorExperienceSourceFirstLast(env, agent, gamma=GAMMA,
+    exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA,
         steps_count=N_ROLLOUT_STEPS)
 
     # Initialize training with performance tracking
@@ -171,13 +165,13 @@ if __name__ == "__main__":
     max_return = -1000.0
 
     # Initialize performance tracker and print training header
-    perf_tracker = PerformanceTracker()
-    network_config = f"{HLAYER1_DIM}-{HLAYER2_DIM} network"
-    hyperparams = {
-        'lr': ALPHA,
-        'batch_size': BATCH_SIZE,
-    }
-    print_training_header(RL_ENV, network_config, hyperparams)
+    # perf_tracker = PerformanceTracker()
+    # network_config = f"{HLAYER1_DIM}-{HLAYER2_DIM} network"
+    # hyperparams = {
+    #     'lr': ALPHA,
+    #     'batch_size': BATCH_SIZE,
+    # }
+    # print_training_header(RL_ENV, network_config, hyperparams)
 
     while not solved:
         iter_no += 1
@@ -185,47 +179,49 @@ if __name__ == "__main__":
 
         # Collect multiple episodes for training
         batch = []
+        exp_iterator = iter(exp_source)
         while len(batch) < BATCH_SIZE:
-            batch.append(next(exp_source))
+            batch.append(next(exp_iterator))
 
         # Training step
-        core_training_loop(...)
+        core_training_loop(net, batch, optimizer)
         batch.clear()
 
         training_time = time.time() - iter_start_time
 
         # Print periodic performance summary every 500 iterations
-        if iter_no % 500 == 0:
-            perf_tracker.print_checkpoint(iter_no, frame_idx)
+        # if iter_no % 500 == 0:
+        #     perf_tracker.print_checkpoint(iter_no, frame_idx)
 
         # Test trials to check success condition
         eval_start_time = time.time()
-        average_return = play_trials(...)
+        average_return = play_trials(test_env, net)
         eval_time = time.time() - eval_start_time
 
         max_return = average_return if (max_return < average_return) else max_return
         trial += 1
 
         # Log performance metrics
-        perf_metrics = perf_tracker.log_iteration(iter_no, frame_idx, average_return, training_time)
+        # perf_metrics = perf_tracker.log_iteration(iter_no, frame_idx, average_return, training_time)
 
         # Enhanced logging with timing information
         print(f"(iter: {iter_no:4d}, trial: {trial:4d}) - "
               f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
-              f"alpha={current_alpha:.2f}, beta={beta:.2f}, eps={experience_action_selector.epsilon:.2f} | "
+
+              #f"alpha={current_alpha:.2f}, beta={beta:.2f}, eps={experience_action_selector.epsilon:.2f} | "
               f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
               f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m")
         solved = average_return > 200.0  # LunarLander is considered solved at 200+ average reward
 
     # Training completed - print comprehensive summary using utility function
-    final_summary = perf_tracker.get_summary()
-    print_final_summary(
-        solved=solved,
-        average_return=average_return,
-        target_reward=<>,
-        final_summary=final_summary,
-        frame_idx=frame_idx,
-        current_alpha=current_alpha,
-        epsilon=experience_action_selector.epsilon,
-        iter_no=iter_no
-    )
+    # final_summary = perf_tracker.get_summary()
+    # print_final_summary(
+    #     solved=solved,
+    #     average_return=average_return,
+    #     target_reward=200.0,
+    #     final_summary=final_summary,
+    #     frame_idx=frame_idx,
+    #     current_alpha=current_alpha,
+    #     epsilon=experience_action_selector.epsilon,
+    #     iter_no=iter_no
+    # )
