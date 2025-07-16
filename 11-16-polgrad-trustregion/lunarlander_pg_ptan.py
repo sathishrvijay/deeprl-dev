@@ -115,12 +115,13 @@ def core_training_loop(
     # 3. Gather probas only for the selected actions for PG loss
     # 4. Don't forget the negative sign for gradient ascent
     adv_v = target_return_v - values_v.squeeze(-1).detach()
-    adv_v = (adv_v - adv_v.mean()) / (adv_v.std(unbiased=False) + 1e-8)
+    # adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
+    # adv_v = (adv_v - adv_v.mean()) / adv_std
     log_actions_v = log_action_probas_v.gather(dim=1, index=actions_v.unsqueeze(1)).squeeze(-1)
     pg_loss_v = -(adv_v * log_actions_v).mean()
 
-    # Note: Entropy is a bonus, so add -ve sign
-    entropy_bonus_v = - ENTROPY_BONUS_BETA * (action_probas_v * log_action_probas_v).sum(dim=1).mean()
+    # Note: Entropy is a bonus, non uniform distribution should increase loss
+    entropy_bonus_v = ENTROPY_BONUS_BETA * (action_probas_v * log_action_probas_v).sum(dim=1).mean()
 
     loss_v = critic_loss_v + pg_loss_v + entropy_bonus_v
     loss_v.backward()
@@ -266,7 +267,7 @@ if __name__ == "__main__":
             int(iter_no), frame_idx, average_return, training_time, eval_time, loss_dict
         )
 
-        if iter_no % 1 == 0:
+        if iter_no % 100 == 0:
             # Enhanced logging with timing information
             print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
                 f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
