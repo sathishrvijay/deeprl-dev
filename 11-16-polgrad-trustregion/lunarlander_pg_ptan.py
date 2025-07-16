@@ -34,7 +34,8 @@ N_TD_STEPS = 10 # Number of steps aggregated per experience (n in n-step TD)
 N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
 
 GAMMA = 0.995
-LR_START = 7e-4
+LR_START = 3e-3
+LR_END = 1e-4
 LR_DECAY_FRAMES = 5e7
 ENTROPY_BONUS_BETA = 1e-3
 
@@ -77,6 +78,10 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
     ls_values_v = ls_values_v.squeeze(1).data
     # Note: important step for computing returns correctly w/ loop unroll
     ls_values_v *= GAMMA ** n_steps
+    # zero out the terminated episodes
+    done_masks_v = torch.tensor(done_masks, dtype=torch.bool)
+    ls_values_v[done_masks_v] = 0.0
+
     returns_v = rewards_v + ls_values_v
     return states_v, actions_v, returns_v
 
@@ -84,7 +89,8 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 def core_training_loop(
     net: nn.Module,
     batch: list,
-    optimizer
+    optimizer,
+    reward_norm=True
     ):
     """In A2C, the entire generated batch of episodes is used for training in every epoch.
     Note: Actor head returns logits
@@ -92,12 +98,15 @@ def core_training_loop(
     """
     optimizer.zero_grad()
 
-    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_ROLLOUT_STEPS)
+    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
     values_v, action_logits_v = net(states_v)
     action_probas_v = nn.functional.softmax(action_logits_v, dim=1)
     log_action_probas_v = nn.functional.log_softmax(action_logits_v, dim=1)
 
     # loss = mse_loss + pg_gain + entropy_bonus
+    if reward_norm:
+        values_v = values_v / 200.0
+        target_return_v = target_return_v / 200.0
     critic_loss_v = nn.functional.mse_loss(values_v.squeeze(-1), target_return_v)
 
     # Key notes for PG loss calc -
@@ -106,17 +115,20 @@ def core_training_loop(
     # 3. Gather probas only for the selected actions for PG loss
     # 4. Don't forget the negative sign for gradient ascent
     adv_v = target_return_v - values_v.squeeze(-1).detach()
-    adv_v = (adv_v - adv_v.mean()) / (adv_v.std() + 1e-8)
+    adv_v = (adv_v - adv_v.mean()) / (adv_v.std(unbiased=False) + 1e-8)
     log_actions_v = log_action_probas_v.gather(dim=1, index=actions_v.unsqueeze(1)).squeeze(-1)
     pg_loss_v = -(adv_v * log_actions_v).mean()
 
-    # Note: Entropy has a negative sign, but its a bonus, so double negatives cancel out
-    entropy_bonus_v = ENTROPY_BONUS_BETA * (action_probas_v * log_action_probas_v).mean()
+    # Note: Entropy is a bonus, so add -ve sign
+    entropy_bonus_v = - ENTROPY_BONUS_BETA * (action_probas_v * log_action_probas_v).sum(dim=1).mean()
 
     loss_v = critic_loss_v + pg_loss_v + entropy_bonus_v
     loss_v.backward()
     # Note: clip gradients beore updating network weights
     torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP_GRAD)
+
+    # grads = [p.grad.norm().item() for p in net.parameters() if p.grad is not None]
+    # print(f" | grad norms min={min(grads):.5f}, max={max(grads):.5f}")
     optimizer.step()
 
     # Return loss components for tracking
@@ -204,6 +216,8 @@ if __name__ == "__main__":
         'n_rollout_steps': N_ROLLOUT_STEPS,
         'batch_size': N_ENVS * N_ROLLOUT_STEPS,
         'lr_start': LR_START,
+        'lr_end': LR_END,
+        'lr_decay_frames': LR_DECAY_FRAMES,
         'gamma': GAMMA,
         'entropy_beta': ENTROPY_BONUS_BETA,
         'clip_grad': CLIP_GRAD
@@ -219,7 +233,7 @@ if __name__ == "__main__":
     while not solved:
         iter_no += 1.0
         # Ensure LR never decays all the way to 0
-        current_lr = max(1e-5, LR_START*(1.0 - frame_idx/LR_DECAY_FRAMES))
+        current_lr = max(LR_END, LR_START*(1.0 - frame_idx/LR_DECAY_FRAMES))
         for g in optimizer.param_groups:
             g["lr"] = current_lr
         iter_start_time = time.time()
@@ -252,7 +266,7 @@ if __name__ == "__main__":
             int(iter_no), frame_idx, average_return, training_time, eval_time, loss_dict
         )
 
-        if iter_no % 100 == 0:
+        if iter_no % 1 == 0:
             # Enhanced logging with timing information
             print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
                 f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
