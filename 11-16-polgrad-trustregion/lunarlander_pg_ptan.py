@@ -28,14 +28,15 @@ HLAYER1_DIM = 128
 # Split original layer2 between Advantage and Value function
 HLAYER2V_DIM = 16
 HLAYER2A_DIM = 48
-N_ROLLOUT_STEPS = 10 # Number of steps to rollout during experience collection
-GAMMA = 0.995
-ALPHA_START = 3e-4
-ENTROPY_BONUS_BETA = 1e-3
-CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
-BATCH_SIZE = 64
 
-LR_DECAY_FRAMES = 4000000
+CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
+N_TD_STEPS = 10 # Number of steps aggregated per experience (n in n-step TD)
+N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
+
+GAMMA = 0.995
+LR_START = 7e-4
+LR_DECAY_FRAMES = 5e7
+ENTROPY_BONUS_BETA = 1e-3
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -184,13 +185,13 @@ if __name__ == "__main__":
     # stochastically sampling actions
     agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
     exp_source = ptan.experience.VectorExperienceSourceFirstLast(vector_env, agent, gamma=GAMMA,
-        steps_count=N_ROLLOUT_STEPS)
+        steps_count=N_TD_STEPS)
 
     # Initialize training with performance tracking
     iter_no = 0.0
     trial = 0
     solved = False
-    optimizer = optim.Adam(net.parameters(), ALPHA_START)
+    optimizer = optim.Adam(net.parameters(), LR_START)
     objective = nn.functional.mse_loss
     max_return = -1000.0
 
@@ -198,34 +199,36 @@ if __name__ == "__main__":
     perf_tracker = PerformanceTracker()
     network_config = f"{HLAYER1_DIM}-{HLAYER2V_DIM}/{HLAYER2A_DIM} A2C network"
     hyperparams = {
-        'lr_start': ALPHA_START,
-        'batch_size': BATCH_SIZE,
         'n_envs': N_ENVS,
+        'n_td_steps': N_TD_STEPS,
         'n_rollout_steps': N_ROLLOUT_STEPS,
+        'batch_size': N_ENVS * N_ROLLOUT_STEPS,
+        'lr_start': LR_START,
         'gamma': GAMMA,
         'entropy_beta': ENTROPY_BONUS_BETA,
-        'clip_grad': CLIP_GRAD,
+        'clip_grad': CLIP_GRAD
     }
     print_training_header(RL_ENV, network_config, hyperparams)
 
     batch = []
     exp_iterator = iter(exp_source)
     # each iteration of exp_source yields N_ENVS experiences
-    num_exp_per_iter = BATCH_SIZE * N_ENVS
-    frame_idx = 0  # Track total frames processed
+    batch_size = N_ROLLOUT_STEPS * N_ENVS
+    frame_idx = 0  # Track total frames of experience generated
 
     while not solved:
         iter_no += 1.0
-        current_lr = ALPHA_START * max(1e-5, 1.0 - frame_idx / LR_DECAY_FRAMES)
+        # Ensure LR never decays all the way to 0
+        current_lr = max(1e-5, LR_START*(1.0 - frame_idx/LR_DECAY_FRAMES))
         for g in optimizer.param_groups:
             g["lr"] = current_lr
         iter_start_time = time.time()
 
         # Collect experiences from parallel envs for training
-        while len(batch) < num_exp_per_iter:
+        while len(batch) < batch_size:
             exp = next(exp_iterator)
             batch.append(exp)
-            frame_idx += N_ENVS  # Each experience represents N_ENVS frames
+        frame_idx += batch_size
 
         # Training step
         loss_dict = core_training_loop(net, batch, optimizer)
@@ -233,7 +236,7 @@ if __name__ == "__main__":
         training_time = time.time() - iter_start_time
 
         # Print periodic performance summary every 500 iterations
-        if iter_no % 500 == 0:
+        if iter_no % 10000 == 0:
             perf_tracker.print_checkpoint(int(iter_no), frame_idx)
 
         # Test trials to check success condition
@@ -249,17 +252,18 @@ if __name__ == "__main__":
             int(iter_no), frame_idx, average_return, training_time, eval_time, loss_dict
         )
 
-        # Enhanced logging with timing information
-        print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
-              f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
-              f"lr={current_lr:.6f}, "
-              f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
-              f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m | "
-              f"losses: total={loss_dict['total_loss']:.4f}, "
-              f"critic={loss_dict['critic_loss']:.4f}, "
-              f"actor={loss_dict['actor_loss']:.4f}, "
-              f"entropy={loss_dict['entropy_loss']:.4f}"
-        )
+        if iter_no % 100 == 0:
+            # Enhanced logging with timing information
+            print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
+                f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
+                f"lr={current_lr:.6f}, "
+                f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
+                f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m | "
+                f"losses: total={loss_dict['total_loss']:.4f}, "
+                f"critic={loss_dict['critic_loss']:.4f}, "
+                f"actor={loss_dict['actor_loss']:.4f}, "
+                f"entropy={loss_dict['entropy_loss']:.4f}"
+            )
         solved = average_return > 200.0  # LunarLander is considered solved at 200+ average reward
 
     # Training completed - print comprehensive summary using utility function
