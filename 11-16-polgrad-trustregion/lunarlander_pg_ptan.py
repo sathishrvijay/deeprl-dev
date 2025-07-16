@@ -37,7 +37,7 @@ GAMMA = 0.995
 LR_START = 3e-3
 LR_END = 1e-4
 LR_DECAY_FRAMES = 5e7
-ENTROPY_BONUS_BETA = 1e-3
+ENTROPY_BONUS_BETA = 1e-2
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -121,7 +121,7 @@ def core_training_loop(
     pg_loss_v = -(adv_v * log_actions_v).mean()
 
     # Note: Entropy is a bonus, non uniform distribution should increase loss
-    entropy_bonus_v = ENTROPY_BONUS_BETA * (action_probas_v * log_action_probas_v).sum(dim=1).mean()
+    entropy_bonus_v = - ENTROPY_BONUS_BETA * (action_probas_v * log_action_probas_v).sum(dim=1).mean()
 
     loss_v = critic_loss_v + pg_loss_v + entropy_bonus_v
     loss_v.backward()
