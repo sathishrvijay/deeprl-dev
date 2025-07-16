@@ -11,8 +11,7 @@ import typing as tt
 from functools import partial
 
 from models import pgtr_models
-# from utils import PerformanceTracker, print_training_header, print_final_summary
-
+from utils import PerformanceTracker, print_training_header, print_final_summary
 
 """This is the implementation of A2C with LunarLander-v1 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
@@ -36,7 +35,7 @@ ENTROPY_BONUS_BETA = 1e-3
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 BATCH_SIZE = 64
 
-LR_DECAY_EPOCHS = 400000
+LR_DECAY_FRAMES = 4000000
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -88,6 +87,7 @@ def core_training_loop(
     ):
     """In A2C, the entire generated batch of episodes is used for training in every epoch.
     Note: Actor head returns logits
+    Returns: Dictionary containing loss components for tracking
     """
     optimizer.zero_grad()
 
@@ -117,6 +117,14 @@ def core_training_loop(
     # Note: clip gradients beore updating network weights
     torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP_GRAD)
     optimizer.step()
+
+    # Return loss components for tracking
+    return {
+        'total_loss': loss_v.item(),
+        'critic_loss': critic_loss_v.item(),
+        'actor_loss': pg_loss_v.item(),
+        'entropy_loss': entropy_bonus_v.item()
+    }
 
 
 def play_trials(test_env: gym.Env, net: nn.Module) -> float:
@@ -179,7 +187,7 @@ if __name__ == "__main__":
         steps_count=N_ROLLOUT_STEPS)
 
     # Initialize training with performance tracking
-    iter_no = 0
+    iter_no = 0.0
     trial = 0
     solved = False
     optimizer = optim.Adam(net.parameters(), ALPHA_START)
@@ -187,21 +195,28 @@ if __name__ == "__main__":
     max_return = -1000.0
 
     # Initialize performance tracker and print training header
-    # perf_tracker = PerformanceTracker()
-    # network_config = f"{HLAYER1_DIM}-{HLAYER2_DIM} network"
-    # hyperparams = {
-    #     'lr': ALPHA,
-    #     'batch_size': BATCH_SIZE,
-    # }
-    # print_training_header(RL_ENV, network_config, hyperparams)
+    perf_tracker = PerformanceTracker()
+    network_config = f"{HLAYER1_DIM}-{HLAYER2V_DIM}/{HLAYER2A_DIM} A2C network"
+    hyperparams = {
+        'lr_start': ALPHA_START,
+        'batch_size': BATCH_SIZE,
+        'n_envs': N_ENVS,
+        'n_rollout_steps': N_ROLLOUT_STEPS,
+        'gamma': GAMMA,
+        'entropy_beta': ENTROPY_BONUS_BETA,
+        'clip_grad': CLIP_GRAD,
+    }
+    print_training_header(RL_ENV, network_config, hyperparams)
 
     batch = []
     exp_iterator = iter(exp_source)
     # each iteration of exp_source yields N_ENVS experiences
     num_exp_per_iter = BATCH_SIZE * N_ENVS
+    frame_idx = 0  # Track total frames processed
+
     while not solved:
-        iter_no += 1
-        current_lr = ALPHA_START * max(1e-5, 1 - iter_no / LR_DECAY_EPOCHS)
+        iter_no += 1.0
+        current_lr = ALPHA_START * max(1e-5, 1.0 - frame_idx / LR_DECAY_FRAMES)
         for g in optimizer.param_groups:
             g["lr"] = current_lr
         iter_start_time = time.time()
@@ -210,16 +225,16 @@ if __name__ == "__main__":
         while len(batch) < num_exp_per_iter:
             exp = next(exp_iterator)
             batch.append(exp)
-
+            frame_idx += N_ENVS  # Each experience represents N_ENVS frames
 
         # Training step
-        core_training_loop(net, batch, optimizer)
+        loss_dict = core_training_loop(net, batch, optimizer)
         batch.clear()
         training_time = time.time() - iter_start_time
 
         # Print periodic performance summary every 500 iterations
-        # if iter_no % 500 == 0:
-        #     perf_tracker.print_checkpoint(iter_no, frame_idx)
+        if iter_no % 500 == 0:
+            perf_tracker.print_checkpoint(int(iter_no), frame_idx)
 
         # Test trials to check success condition
         eval_start_time = time.time()
@@ -230,27 +245,32 @@ if __name__ == "__main__":
         trial += 1
 
         # Log performance metrics
-        # perf_metrics = perf_tracker.log_iteration(iter_no, frame_idx, average_return, training_time)
+        perf_metrics = perf_tracker.log_iteration(
+            int(iter_no), frame_idx, average_return, training_time, eval_time, loss_dict
+        )
 
         # Enhanced logging with timing information
-        print(f"(iter: {iter_no:4d}, trial: {trial:4d}) - "
+        print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
               f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
-              f"lr={current_lr:.5f}, "
-              #f"alpha={current_alpha:.2f}, beta={beta:.2f}, eps={experience_action_selector.epsilon:.2f} | "
+              f"lr={current_lr:.6f}, "
               f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
-              #f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m"
+              f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m | "
+              f"losses: total={loss_dict['total_loss']:.4f}, "
+              f"critic={loss_dict['critic_loss']:.4f}, "
+              f"actor={loss_dict['actor_loss']:.4f}, "
+              f"entropy={loss_dict['entropy_loss']:.4f}"
         )
         solved = average_return > 200.0  # LunarLander is considered solved at 200+ average reward
 
     # Training completed - print comprehensive summary using utility function
-    # final_summary = perf_tracker.get_summary()
-    # print_final_summary(
-    #     solved=solved,
-    #     average_return=average_return,
-    #     target_reward=200.0,
-    #     final_summary=final_summary,
-    #     frame_idx=frame_idx,
-    #     current_alpha=current_alpha,
-    #     epsilon=experience_action_selector.epsilon,
-    #     iter_no=iter_no
-    # )
+    final_summary = perf_tracker.get_summary()
+    print_final_summary(
+        solved=solved,
+        average_return=average_return,
+        target_reward=200.0,
+        final_summary=final_summary,
+        frame_idx=frame_idx,
+        current_alpha=current_lr,
+        epsilon=0.0,  # Not using epsilon in this implementation
+        iter_no=int(iter_no)
+    )
