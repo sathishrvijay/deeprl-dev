@@ -34,3 +34,12 @@ class A2CDiscreteAction(nn.Module):
         x = self.base_layer(x)
         value, actions = self.critic_head(x), self.actor_head(x)
         return value, actions
+
+
+class DiscreteA2CCritic(nn.Module):
+    """Advantage Actor-Critic Crtic Model for discrete actions."""
+    pass
+
+class DiscreteA2CActor(nn.Module):
+    """Advantage Actor-Critic Actor Model for discrete actions."""
+    pass
