@@ -30,7 +30,7 @@ HLAYER2V_DIM = 16
 HLAYER2A_DIM = 48
 
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
-N_TD_STEPS = 10 # Number of steps aggregated per experience (n in n-step TD)
+N_TD_STEPS = 4 # Number of steps aggregated per experience (n in n-step TD)
 N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
 
 GAMMA = 0.995
