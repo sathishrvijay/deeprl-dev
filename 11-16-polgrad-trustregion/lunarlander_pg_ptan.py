@@ -29,15 +29,18 @@ HLAYER1_DIM = 128
 HLAYER2V_DIM = 16
 HLAYER2A_DIM = 48
 
-CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 N_TD_STEPS = 4 # Number of steps aggregated per experience (n in n-step TD)
 N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
 
 GAMMA = 0.995
-LR_START = 3e-3
+LR_START = 7e-4
 LR_END = 1e-4
 LR_DECAY_FRAMES = 5e7
-ENTROPY_BONUS_BETA = 1e-2
+
+# PG related
+MAX_LOGIT = 10.0
+ENTROPY_BONUS_BETA = 5e-2
+CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -90,7 +93,10 @@ def core_training_loop(
     net: nn.Module,
     batch: list,
     optimizer,
-    reward_norm=True
+    scheduler,
+    iter_no=None,
+    reward_norm=True,
+    debug=True
     ):
     """In A2C, the entire generated batch of episodes is used for training in every epoch.
     Note: Actor head returns logits
@@ -100,6 +106,7 @@ def core_training_loop(
 
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
     values_v, action_logits_v = net(states_v)
+    # To prevent soft max pushing policy to be deterministic very fast. Don't using clamping as it kills gradients
     action_probas_v = nn.functional.softmax(action_logits_v, dim=1)
     log_action_probas_v = nn.functional.log_softmax(action_logits_v, dim=1)
 
@@ -115,29 +122,46 @@ def core_training_loop(
     # 3. Gather probas only for the selected actions for PG loss
     # 4. Don't forget the negative sign for gradient ascent
     adv_v = target_return_v - values_v.squeeze(-1).detach()
-    # adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
-    # adv_v = (adv_v - adv_v.mean()) / adv_std
+    # Normalize adv
+    adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
+    adv_v = (adv_v - adv_v.mean()) / adv_std
+
     log_actions_v = log_action_probas_v.gather(dim=1, index=actions_v.unsqueeze(1)).squeeze(-1)
     pg_loss_v = -(adv_v * log_actions_v).mean()
 
     # Note: Entropy is a bonus, non uniform distribution should increase loss
-    entropy_bonus_v = - ENTROPY_BONUS_BETA * (action_probas_v * log_action_probas_v).sum(dim=1).mean()
+    entropy_v = -(action_probas_v * log_action_probas_v).sum(dim=1).mean()
+    entropy_bonus_v = ENTROPY_BONUS_BETA * entropy_v
 
-    loss_v = critic_loss_v + pg_loss_v + entropy_bonus_v
+    # To prevent soft max pushing policy to be deterministic very fast.
+    # Don't using clamping as it kills gradients
+    soft_penalty_v = 1e-4 * ((action_logits_v / MAX_LOGIT).tanh() * MAX_LOGIT
+        - action_logits_v).pow(2).mean()
+
+    loss_v = critic_loss_v + pg_loss_v - entropy_bonus_v + soft_penalty_v
     loss_v.backward()
     # Note: clip gradients beore updating network weights
     torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP_GRAD)
 
-    # grads = [p.grad.norm().item() for p in net.parameters() if p.grad is not None]
-    # print(f" | grad norms min={min(grads):.5f}, max={max(grads):.5f}")
     optimizer.step()
+    scheduler.step()
+
+    # Debug - check policy & gradient norms
+    if debug and iter_no % 100 == 0:
+        probas = action_probas_v.mean(dim=0).cpu().detach().numpy()
+        print(f"π = {np.round(probas, 3)}")    # e.g. π = [0.26 0.24 0.29 0.21]
+        # grad_norms = {n: p.grad.norm().item()
+        #               for n, p in net.named_parameters() if p.grad is not None}
+        # print("grad ∥ :", {k: round(v, 4) for k, v in grad_norms.items()})
 
     # Return loss components for tracking
     return {
         'total_loss': loss_v.item(),
         'critic_loss': critic_loss_v.item(),
         'actor_loss': pg_loss_v.item(),
-        'entropy_loss': entropy_bonus_v.item()
+        'entropy_raw': entropy_v.item(),
+        'entropy_loss': entropy_bonus_v.item(),
+        'logit_penalty': soft_penalty_v.item()
     }
 
 
@@ -192,7 +216,6 @@ if __name__ == "__main__":
         HLAYER2V_DIM, HLAYER2A_DIM, n_actions)
 
     # Setup the Agent & policy
-    # TODO: We need VectorExperience for multiple environments
     experience_action_selector = ptan.actions.ProbabilityActionSelector()
     # Note: network returns logits, so we need to apply softmax before
     # stochastically sampling actions
@@ -204,9 +227,16 @@ if __name__ == "__main__":
     iter_no = 0.0
     trial = 0
     solved = False
-    optimizer = optim.Adam(net.parameters(), LR_START)
+    # A2C reports more stable results w/ RMSProp w/ Linear LR decay
+    optimizer = optim.RMSprop(net.parameters(), lr=LR_START, eps=1e-5, alpha=0.99)
     objective = nn.functional.mse_loss
     max_return = -1000.0
+
+    # each iteration of exp_source yields N_ENVS experiences
+    batch_size = N_ROLLOUT_STEPS * N_ENVS
+    scheduler = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1.0, end_factor=LR_END / LR_START,
+        total_iters=LR_DECAY_FRAMES // batch_size)
 
     # Initialize performance tracker and print training header
     perf_tracker = PerformanceTracker()
@@ -227,16 +257,13 @@ if __name__ == "__main__":
 
     batch = []
     exp_iterator = iter(exp_source)
-    # each iteration of exp_source yields N_ENVS experiences
-    batch_size = N_ROLLOUT_STEPS * N_ENVS
     frame_idx = 0  # Track total frames of experience generated
-
     while not solved:
         iter_no += 1.0
         # Ensure LR never decays all the way to 0
-        current_lr = max(LR_END, LR_START*(1.0 - frame_idx/LR_DECAY_FRAMES))
-        for g in optimizer.param_groups:
-            g["lr"] = current_lr
+        # current_lr = max(LR_END, LR_START*(1.0 - frame_idx/LR_DECAY_FRAMES))
+        # for g in optimizer.param_groups:
+        #     g["lr"] = current_lr
         iter_start_time = time.time()
 
         # Collect experiences from parallel envs for training
@@ -246,7 +273,7 @@ if __name__ == "__main__":
         frame_idx += batch_size
 
         # Training step
-        loss_dict = core_training_loop(net, batch, optimizer)
+        loss_dict = core_training_loop(net, batch, optimizer, scheduler, iter_no)
         batch.clear()
         training_time = time.time() - iter_start_time
 
@@ -269,20 +296,25 @@ if __name__ == "__main__":
 
         if iter_no % 100 == 0:
             # Enhanced logging with timing information
+            current_lr = optimizer.param_groups[0]["lr"]
             print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
                 f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
-                f"lr={current_lr:.6f}, "
+                f"lr={current_lr:.5e}, "
                 f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
                 f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m | "
                 f"losses: total={loss_dict['total_loss']:.4f}, "
                 f"critic={loss_dict['critic_loss']:.4f}, "
                 f"actor={loss_dict['actor_loss']:.4f}, "
-                f"entropy={loss_dict['entropy_loss']:.4f}"
+                f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
+                f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
+                f"logit_penalty={loss_dict['logit_penalty']:.4e}"
             )
+
         solved = average_return > 200.0  # LunarLander is considered solved at 200+ average reward
 
     # Training completed - print comprehensive summary using utility function
     final_summary = perf_tracker.get_summary()
+    current_lr = optimizer.param_groups[0]["lr"]
     print_final_summary(
         solved=solved,
         average_return=average_return,
