@@ -13,28 +13,31 @@ from functools import partial
 from models import pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
-"""This is the implementation of A2C with LunarLander-v1 RL using the PTAN wrapper libraries.
+"""This is the implementation of A2C with LunarLander-v2 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
 PG methods like A3C, DDPG, SAC, PPO and others.
-TODO: 07/15/25 - Add overall metrics tracking as well as tracking of total loss,
-value loss, entropy bonus and advantage etc
+Modified to use separate Actor and Critic networks with different optimizers and learning rates.
 """
 
 # HPARAMS
 RL_ENV = "LunarLander-v2"
 N_ENVS = 16
-HIDDEN_LAYER_DIM = 256
-HLAYER1_DIM = 128
-# Split original layer2 between Advantage and Value function
-HLAYER2V_DIM = 16
-HLAYER2A_DIM = 48
+
+# Separate network dimensions
+CRITIC_HIDDEN1_DIM = 128
+CRITIC_HIDDEN2_DIM = 32
+ACTOR_HIDDEN1_DIM = 128
+ACTOR_HIDDEN2_DIM = 64
 
 N_TD_STEPS = 4 # Number of steps aggregated per experience (n in n-step TD)
 N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
 
 GAMMA = 0.995
-LR_START = 7e-4
-LR_END = 1e-4
+# Separate learning rates for actor and critic
+CRITIC_LR_START = 7e-4
+CRITIC_LR_END = 1e-4
+ACTOR_LR_START = 3e-4
+ACTOR_LR_END = 5e-5
 LR_DECAY_FRAMES = 5e7
 
 # PG related
@@ -92,8 +95,10 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 def core_training_loop(
     net: nn.Module,
     batch: list,
-    optimizer,
-    scheduler,
+    actor_optimizer,
+    critic_optimizer,
+    actor_scheduler,
+    critic_scheduler,
     iter_no=None,
     reward_norm=True,
     debug=True
@@ -102,7 +107,8 @@ def core_training_loop(
     Note: Actor head returns logits
     Returns: Dictionary containing loss components for tracking
     """
-    optimizer.zero_grad()
+    actor_optimizer.zero_grad()
+    critic_optimizer.zero_grad()
 
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
     values_v, action_logits_v = net(states_v)
@@ -138,27 +144,33 @@ def core_training_loop(
     soft_penalty_v = 1e-4 * ((action_logits_v / MAX_LOGIT).tanh() * MAX_LOGIT
         - action_logits_v).pow(2).mean()
 
-    loss_v = critic_loss_v + pg_loss_v - entropy_bonus_v + soft_penalty_v
-    loss_v.backward()
-    # Note: clip gradients beore updating network weights
-    torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP_GRAD)
+    # Separate loss computation and backpropagation
+    # Critic loss (only affects critic network)
+    critic_loss_v.backward()
+    torch.nn.utils.clip_grad_norm_(net.get_critic_parameters(), CLIP_GRAD)
+    critic_optimizer.step()
+    critic_scheduler.step()
 
-    optimizer.step()
-    scheduler.step()
+    # Actor loss (only affects actor network)
+    actor_loss_v = pg_loss_v - entropy_bonus_v + soft_penalty_v
+    actor_loss_v.backward()
+    torch.nn.utils.clip_grad_norm_(net.get_actor_parameters(), CLIP_GRAD)
+    actor_optimizer.step()
+    actor_scheduler.step()
+
+    # Total loss for logging (not used for backprop)
+    total_loss_v = critic_loss_v + actor_loss_v
 
     # Debug - check policy & gradient norms
     if debug and iter_no % 100 == 0:
         probas = action_probas_v.mean(dim=0).cpu().detach().numpy()
         print(f"π = {np.round(probas, 3)}")    # e.g. π = [0.26 0.24 0.29 0.21]
-        # grad_norms = {n: p.grad.norm().item()
-        #               for n, p in net.named_parameters() if p.grad is not None}
-        # print("grad ∥ :", {k: round(v, 4) for k, v in grad_norms.items()})
 
     # Return loss components for tracking
     return {
-        'total_loss': loss_v.item(),
+        'total_loss': total_loss_v.item(),
         'critic_loss': critic_loss_v.item(),
-        'actor_loss': pg_loss_v.item(),
+        'actor_loss': actor_loss_v.item(),
         'entropy_raw': entropy_v.item(),
         'entropy_loss': entropy_bonus_v.item(),
         'logit_penalty': soft_penalty_v.item()
@@ -209,11 +221,14 @@ if __name__ == "__main__":
     # don't need a vectorized trial env
     test_env = gym.make(RL_ENV)
 
-    # setup the agent and target net
+    # setup the agent and target net - using separate actor-critic networks
     n_states = vector_env.single_observation_space.shape[0]  # LunarLander has Box(8,) observation space
     n_actions = vector_env.single_action_space.n
-    net = pgtr_models.A2CDiscreteAction(n_states, HLAYER1_DIM,
-        HLAYER2V_DIM, HLAYER2A_DIM, n_actions)
+    net = pgtr_models.A2CDiscreteActionSeparate(
+        n_states, n_actions,
+        CRITIC_HIDDEN1_DIM, CRITIC_HIDDEN2_DIM,
+        ACTOR_HIDDEN1_DIM, ACTOR_HIDDEN2_DIM
+    )
 
     # Setup the Agent & policy
     experience_action_selector = ptan.actions.ProbabilityActionSelector()
@@ -227,27 +242,37 @@ if __name__ == "__main__":
     iter_no = 0.0
     trial = 0
     solved = False
-    # A2C reports more stable results w/ RMSProp w/ Linear LR decay
-    optimizer = optim.RMSprop(net.parameters(), lr=LR_START, eps=1e-5, alpha=0.99)
-    objective = nn.functional.mse_loss
+
+    # Separate optimizers for actor and critic
+    # A2C reports more stable results w/ RMSProp for critic, Adam for actor
+    critic_optimizer = optim.RMSprop(net.get_critic_parameters(), lr=CRITIC_LR_START, eps=1e-5, alpha=0.99)
+    actor_optimizer = optim.Adam(net.get_actor_parameters(), lr=ACTOR_LR_START, eps=1e-5)
+
     max_return = -1000.0
 
     # each iteration of exp_source yields N_ENVS experiences
     batch_size = N_ROLLOUT_STEPS * N_ENVS
-    scheduler = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1.0, end_factor=LR_END / LR_START,
+
+    # Separate schedulers for actor and critic
+    critic_scheduler = optim.lr_scheduler.LinearLR(
+        critic_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
+        total_iters=LR_DECAY_FRAMES // batch_size)
+    actor_scheduler = optim.lr_scheduler.LinearLR(
+        actor_optimizer, start_factor=1.0, end_factor=ACTOR_LR_END / ACTOR_LR_START,
         total_iters=LR_DECAY_FRAMES // batch_size)
 
     # Initialize performance tracker and print training header
     perf_tracker = PerformanceTracker()
-    network_config = f"{HLAYER1_DIM}-{HLAYER2V_DIM}/{HLAYER2A_DIM} A2C network"
+    network_config = f"Separate A2C: Critic({CRITIC_HIDDEN1_DIM}-{CRITIC_HIDDEN2_DIM}), Actor({ACTOR_HIDDEN1_DIM}-{ACTOR_HIDDEN2_DIM})"
     hyperparams = {
         'n_envs': N_ENVS,
         'n_td_steps': N_TD_STEPS,
         'n_rollout_steps': N_ROLLOUT_STEPS,
         'batch_size': N_ENVS * N_ROLLOUT_STEPS,
-        'lr_start': LR_START,
-        'lr_end': LR_END,
+        'critic_lr_start': CRITIC_LR_START,
+        'critic_lr_end': CRITIC_LR_END,
+        'actor_lr_start': ACTOR_LR_START,
+        'actor_lr_end': ACTOR_LR_END,
         'lr_decay_frames': LR_DECAY_FRAMES,
         'gamma': GAMMA,
         'entropy_beta': ENTROPY_BONUS_BETA,
@@ -260,10 +285,6 @@ if __name__ == "__main__":
     frame_idx = 0  # Track total frames of experience generated
     while not solved:
         iter_no += 1.0
-        # Ensure LR never decays all the way to 0
-        # current_lr = max(LR_END, LR_START*(1.0 - frame_idx/LR_DECAY_FRAMES))
-        # for g in optimizer.param_groups:
-        #     g["lr"] = current_lr
         iter_start_time = time.time()
 
         # Collect experiences from parallel envs for training
@@ -272,8 +293,11 @@ if __name__ == "__main__":
             batch.append(exp)
         frame_idx += batch_size
 
-        # Training step
-        loss_dict = core_training_loop(net, batch, optimizer, scheduler, iter_no)
+        # Training step with separate optimizers
+        loss_dict = core_training_loop(
+            net, batch, actor_optimizer, critic_optimizer,
+            actor_scheduler, critic_scheduler, iter_no
+        )
         batch.clear()
         training_time = time.time() - iter_start_time
 
@@ -295,11 +319,12 @@ if __name__ == "__main__":
         )
 
         if iter_no % 100 == 0:
-            # Enhanced logging with timing information
-            current_lr = optimizer.param_groups[0]["lr"]
+            # Enhanced logging with timing information and separate learning rates
+            critic_lr = critic_optimizer.param_groups[0]["lr"]
+            actor_lr = actor_optimizer.param_groups[0]["lr"]
             print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
                 f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
-                f"lr={current_lr:.5e}, "
+                f"critic_lr={critic_lr:.5e}, actor_lr={actor_lr:.5e}, "
                 f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
                 f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m | "
                 f"losses: total={loss_dict['total_loss']:.4f}, "
@@ -314,14 +339,15 @@ if __name__ == "__main__":
 
     # Training completed - print comprehensive summary using utility function
     final_summary = perf_tracker.get_summary()
-    current_lr = optimizer.param_groups[0]["lr"]
+    critic_lr = critic_optimizer.param_groups[0]["lr"]
+    actor_lr = actor_optimizer.param_groups[0]["lr"]
     print_final_summary(
         solved=solved,
         average_return=average_return,
         target_reward=200.0,
         final_summary=final_summary,
         frame_idx=frame_idx,
-        current_alpha=current_lr,
+        current_alpha=f"critic:{critic_lr:.2e}, actor:{actor_lr:.2e}",
         epsilon=0.0,  # Not using epsilon in this implementation
         iter_no=int(iter_no)
     )
