@@ -367,7 +367,7 @@ if __name__ == "__main__":
         target_reward=PENDULUM_SOLVED_REWARD,
         final_summary=final_summary,
         frame_idx=frame_idx,
-        current_alpha=f"critic:{critic_lr:.2e}, actor:{actor_lr:.2e}",
+        current_alpha=(actor_lr, critic_lr),
         epsilon=0.0,  # Not using epsilon in this implementation
         iter_no=int(iter_no)
     )

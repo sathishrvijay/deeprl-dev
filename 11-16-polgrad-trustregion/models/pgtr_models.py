@@ -174,13 +174,25 @@ class ContinuousA2C(nn.Module):
         action_params is a concatenated tensor of [mean, log_var] for each action dimension.
         """
         value = self.critic(x)
-        actions_mean, actions_log_var = self.actor(x)
-        return actions_mean, actions_log_var, value
+        actions_mean, actions_logvar = self.actor(x)
+        return actions_mean, actions_logvar, value
 
     def get_action_distribution(self, x: torch.Tensor):
         """Get separate action mean and log variance tensors."""
-        actions_mean, actions_log_var = self.actor(x)
-        return actions_mean, actions_log_var
+        actions_mean, actions_logvar = self.actor(x)
+        return actions_mean, actions_logvar
+
+    def sample_action(self, state: torch.Tensor, deterministic: bool = False):
+        """Sample action from the policy. Used for evaluation and action selection."""
+        with torch.no_grad():
+            actions_mean, actions_logvar = self.get_action_distribution(state)
+
+            if deterministic:
+                return actions_mean
+            else:
+                std = torch.exp(actions_logvar / 2)
+                eps = torch.randn_like(std)
+                return actions_mean + std * eps
 
     def get_actor_parameters(self):
         """Get actor network parameters for separate optimization."""
@@ -189,35 +201,3 @@ class ContinuousA2C(nn.Module):
     def get_critic_parameters(self):
         """Get critic network parameters for separate optimization."""
         return self.critic.parameters()
-
-    def sample_action(self, state: torch.Tensor, deterministic: bool = False):
-        """Sample action from the policy. Used for evaluation and action selection."""
-        with torch.no_grad():
-            actions_mean, actions_log_var = self.get_action_distribution(state)
-
-            if deterministic:
-                return actions_mean
-            else:
-                std = torch.exp(actions_log_var / 2)
-                eps = torch.randn_like(std)
-                return actions_mean + std * eps
-
-    def compute_log_prob(self, states: torch.Tensor, actions: torch.Tensor):
-        """Compute log probability of given actions under current policy."""
-        action_mean, action_log_var = self.get_action_distribution(states)
-
-        # Gaussian log probability: -0.5 * (log(2π) + log_var + (x-μ)²/σ²)
-        log_prob = -0.5 * (
-            torch.log(torch.tensor(2 * torch.pi)) +
-            action_log_var +
-            (actions - action_mean).pow(2) / torch.exp(action_log_var)
-        )
-        return log_prob.sum(dim=-1)  # Sum over action dimensions
-
-    def compute_entropy(self, states: torch.Tensor):
-        """Compute entropy of the policy at given states."""
-        _, action_log_var = self.get_action_distribution(states)
-
-        # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
-        entropy = 0.5 * (action_log_var + torch.log(torch.tensor(2 * torch.pi * torch.e)))
-        return entropy.sum(dim=-1)  # Sum over action dimensions
