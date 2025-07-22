@@ -170,15 +170,11 @@ class ContinuousA2C(nn.Module):
         self.actor = ContinuousA2CActor(state_dim, action_dim, actor_hidden1_dim, actor_hidden2_dim)
 
     def forward(self, x: torch.Tensor):
-        """Forward pass that returns (value, action_params) for PTAN compatibility.
-        action_params is a concatenated tensor of [mean, log_var] for each action dimension.
-        """
         value = self.critic(x)
         actions_mean, actions_logvar = self.actor(x)
         return actions_mean, actions_logvar, value
 
     def get_action_distribution(self, x: torch.Tensor):
-        """Get separate action mean and log variance tensors."""
         actions_mean, actions_logvar = self.actor(x)
         return actions_mean, actions_logvar
 
@@ -195,9 +191,83 @@ class ContinuousA2C(nn.Module):
                 return actions_mean + std * eps
 
     def get_actor_parameters(self):
-        """Get actor network parameters for separate optimization."""
         return self.actor.parameters()
 
     def get_critic_parameters(self):
-        """Get critic network parameters for separate optimization."""
+        return self.critic.parameters()
+
+
+class DDPGActor(nn.Module):
+    """Actor network in DDPG is deterministic (unlike CA A2C and PPO)"""
+    def __init__(self, state_dim: int, action_dim: int, hidden1_dim: int = 128, hidden2_dim: int = 64):
+        super(DDPGActor, self).__init__()
+
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden1_dim),
+            nn.LayerNorm(hidden1_dim),
+            nn.ReLU(),
+            nn.Linear(hidden1_dim, hidden2_dim),
+            nn.LayerNorm(hidden2_dim),
+            nn.ReLU(),
+            nn.Linear(hidden2_dim, action_dim)
+        )
+
+    def forward(self, x: torch.Tensor):
+        # tanh scaling to action bounds [-2, 2] for Pendulum
+        actions_mu = torch.tanh(self.network(x)) * 2.0
+        return actions_mu
+
+
+class DDPGCritic(nn.Module):
+    """Critic Network for DDPG takes current action as input"""
+    def __init__(self, state_dim: int, action_dim: int, hidden1_dim: int = 128, hidden2_dim: int = 32):
+        super(DDPGCritic, self).__init__()
+        self.state_stack = nn.Sequential(
+            nn.Linear(state_dim, hidden1_dim),
+            nn.LayerNorm(hidden1_dim),
+            nn.ReLU()
+        )
+        self.actionstate_stack = nn.Sequential(
+            nn.Linear(hidden1_dim + action_dim, hidden2_dim),
+            nn.LayerNorm(hidden2_dim),
+            nn.ReLU(),
+            nn.Linear(hidden2_dim, 1)
+        )
+
+    def forward(self, x: torch.Tensor, actions: torch.Tensor):
+        x = self.state_stack(x)
+        return self.actionstate_stack(torch.concat((x, actions), dim=-1))
+
+
+class DDPG(nn.Module):
+    """Wrapper class for separate DDPG Actor and Critic networks to maintain PTAN compatibility."""
+    def __init__(self, state_dim: int, action_dim: int,
+                 critic_hidden1_dim: int = 128, critic_hidden2_dim: int = 32,
+                 actor_hidden1_dim: int = 128, actor_hidden2_dim: int = 64):
+        super(DDPG, self).__init__()
+        self.action_dim = action_dim
+        self.critic = DDPGCritic(state_dim, action_dim, critic_hidden1_dim, critic_hidden2_dim)
+        self.actor = DDPGActor(state_dim, action_dim, actor_hidden1_dim, actor_hidden2_dim)
+
+    def forward(self, x: torch.Tensor):
+        value = self.critic(x)
+        actions_mean = self.actor(x)
+        return actions_mean, value
+
+    def sample_action(self, state: torch.Tensor, deterministic: bool = False):
+        """Sample action from the policy. Used for evaluation and action selection."""
+        with torch.no_grad():
+            actions_mean = self.actor(state)
+
+            if deterministic:
+                return actions_mean
+            else:
+                # TODO: Implement OU noise
+                pass
+
+
+    def get_actor_parameters(self):
+        return self.actor.parameters()
+
+    def get_critic_parameters(self):
         return self.critic.parameters()
