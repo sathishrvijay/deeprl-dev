@@ -219,7 +219,7 @@ class DDPGActor(nn.Module):
 
 
 class DDPGCritic(nn.Module):
-    """Critic Network for DDPG takes current action as input"""
+    """Critic Network for DDPG takes current action as input and returns Q(s, a)"""
     def __init__(self, state_dim: int, action_dim: int, hidden1_dim: int = 128, hidden2_dim: int = 32):
         super(DDPGCritic, self).__init__()
         self.state_stack = nn.Sequential(
@@ -227,7 +227,7 @@ class DDPGCritic(nn.Module):
             nn.LayerNorm(hidden1_dim),
             nn.ReLU()
         )
-        self.actionstate_stack = nn.Sequential(
+        self.actionvalue_stack = nn.Sequential(
             nn.Linear(hidden1_dim + action_dim, hidden2_dim),
             nn.LayerNorm(hidden2_dim),
             nn.ReLU(),
@@ -236,7 +236,7 @@ class DDPGCritic(nn.Module):
 
     def forward(self, x: torch.Tensor, actions: torch.Tensor):
         x = self.state_stack(x)
-        return self.actionstate_stack(torch.concat((x, actions), dim=-1))
+        return self.actionvalue_stack(torch.concat((x, actions), dim=-1))
 
 
 class DDPG(nn.Module):
@@ -250,9 +250,9 @@ class DDPG(nn.Module):
         self.actor = DDPGActor(state_dim, action_dim, actor_hidden1_dim, actor_hidden2_dim)
 
     def forward(self, x: torch.Tensor):
-        value = self.critic(x)
         actions_mean = self.actor(x)
-        return actions_mean, value
+        qvalue = self.critic(x, actions_mean)
+        return actions_mean, qvalue
 
     def sample_action(self, state: torch.Tensor, deterministic: bool = False):
         """Sample action from the policy. Used for evaluation and action selection."""
@@ -263,8 +263,7 @@ class DDPG(nn.Module):
                 return actions_mean
             else:
                 # TODO: Implement OU noise
-                pass
-
+                return actions_mean
 
     def get_actor_parameters(self):
         return self.actor.parameters()

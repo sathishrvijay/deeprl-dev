@@ -13,12 +13,7 @@ from functools import partial
 from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
-"""This is the implementation of A2C with Pendulum-v1 RL using the PTAN wrapper libraries.
-A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
-PG methods like A3C, DDPG, SAC, PPO and others.
-Modified to use separate Actor and Critic networks with different optimizers and learning rates.
-Adapted for continuous action spaces using Gaussian policies with log variance parameterization.
-"""
+"""This is the implementation of DDPG with Pendulum-v1 RL using the PTAN wrapper libraries."""
 
 # HPARAMS
 RL_ENV = "Pendulum-v1"
@@ -87,7 +82,7 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
     # return states, actions, returns
     with torch.no_grad():
-        _, _, ls_values_v = net(last_states_v)
+        _, ls_values_v = net(last_states_v)
 
     ls_values_v = ls_values_v.squeeze(1).data
     # Note: important step for computing returns correctly w/ loop unroll
@@ -243,7 +238,7 @@ if __name__ == "__main__":
     # setup the agent and target net - using continuous action networks
     n_states = vector_env.single_observation_space.shape[0]  # Pendulum has Box(3,) observation space
     n_actions = vector_env.single_action_space.shape[0]      # Pendulum has Box(1,) action space
-    net = pgtr_models.ContinuousA2C(
+    net = pgtr_models.DDPG(
         n_states, n_actions,
         CRITIC_HIDDEN1_DIM, CRITIC_HIDDEN2_DIM,
         ACTOR_HIDDEN1_DIM, ACTOR_HIDDEN2_DIM
@@ -305,7 +300,6 @@ if __name__ == "__main__":
     while not solved:
         iter_no += 1.0
         iter_start_time = time.time()
-
         # Collect experiences from parallel envs for training
         while len(batch) < batch_size:
             exp = next(exp_iterator)
