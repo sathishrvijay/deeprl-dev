@@ -6,109 +6,12 @@ import torch.optim as optim
 import numpy as np
 import time
 import math
-from datetime import datetime, timedelta
 
 import typing as tt
 from functools import partial
 
-from models import pgtr_models
+from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
-
-
-class ContinuousActionSelector(ptan.actions.ActionSelector):
-    """Custom action selector for continuous actions that samples from Gaussian policy."""
-
-    def __init__(self, deterministic: bool = False):
-        self.deterministic = deterministic
-
-    def __call__(self, scores):
-        """
-        Args:
-            scores: concatenated numpy array of [action_mean, action_log_var]
-                   Can be either:
-                   - Single env: shape (2*action_dim,) 
-                   - Batch: shape (batch_size, 2*action_dim)
-        Returns:
-            numpy array of sampled actions
-        """
-        # Work directly with numpy arrays since PTAN always passes numpy
-        if not isinstance(scores, np.ndarray):
-            scores = scores.cpu().data.numpy()  # Convert tensor to numpy if needed
-        
-        # Debug: Print what we're actually receiving
-        print(f"🔍 Action selector received: shape={scores.shape}, dtype={scores.dtype}")
-        if scores.size > 0:
-            print(f"🔍 First few values: {scores.flatten()[:4]}")
-        
-        # EMERGENCY FIX: If we're getting wrong shape, try to handle it gracefully
-        if scores.shape == (16, 1) or (len(scores.shape) == 2 and scores.shape[1] == 1):
-            print(f"⚠️  WARNING: Received unexpected shape {scores.shape}")
-            print(f"⚠️  This suggests PTAN is passing values instead of action parameters")
-            print(f"⚠️  Using fallback: treating input as action mean, using default log_var")
-            
-            # Use the received values as action mean, add default log_var
-            action_mean = scores
-            action_log_var = np.full_like(action_mean, -1.0)  # Default log_var = -1 (std ≈ 0.6)
-            
-            if self.deterministic:
-                actions = action_mean
-            else:
-                std = np.exp(action_log_var / 2)
-                eps = np.random.randn(*std.shape)
-                actions = action_mean + std * eps
-            
-            # Clip actions to Pendulum bounds [-2, 2]
-            actions = np.clip(actions, -2.0, 2.0)
-            
-            # Return correct format for vectorized environment
-            if actions.shape[0] > 1:  # Batch case
-                return actions  # Shape: (batch_size, 1)
-            else:  # Single environment case
-                return actions.flatten()  # Shape: (1,)
-        
-        # NORMAL PROCESSING: Handle correct input format
-        # Handle single environment case (1D array)
-        if scores.ndim == 1:
-            scores = scores.reshape(1, -1)  # Convert to batch format
-            single_env = True
-        else:
-            single_env = False
-        
-        # Handle edge case where scores might be empty or malformed
-        if scores.size == 0:
-            print(f"❌ ERROR: Empty scores array received in action selector")
-            return np.array([0.0])  # Return scalar for single env
-        
-        # Split the concatenated array back into mean and log_var
-        batch_size = scores.shape[0]
-        if len(scores.shape) < 2:
-            print(f"❌ ERROR: Scores has wrong dimensions: {scores.shape}")
-            return np.array([0.0])
-            
-        action_dim = scores.shape[1] // 2
-        
-        if action_dim == 0:
-            print(f"❌ ERROR: Invalid action_dim=0, scores shape: {scores.shape}")
-            print(f"❌ This means scores.shape[1]={scores.shape[1]}, so action_dim={scores.shape[1]}//2=0")
-            print(f"❌ Expected scores.shape[1] to be 2 for Pendulum (mean + log_var)")
-            return np.array([0.0])
-        
-        action_mean = scores[:, :action_dim]
-        action_log_var = scores[:, action_dim:]
-        
-        if self.deterministic:
-            actions = action_mean
-        else:
-            # Use numpy operations instead of PyTorch
-            std = np.exp(action_log_var / 2)
-            eps = np.random.randn(*std.shape)
-            actions = action_mean + std * eps
-        
-        # For single environment, return 1D array (what Pendulum expects)
-        if single_env:
-            return actions.flatten()  # Convert (1, 1) -> (1,) for Pendulum
-        
-        return actions
 
 """This is the implementation of A2C with Pendulum-v1 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
@@ -184,7 +87,7 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
     # return states, actions, returns
     with torch.no_grad():
-        ls_values_v, _ = net(last_states_v)
+        _, _, ls_values_v = net(last_states_v)
 
     ls_values_v = ls_values_v.squeeze(1).data
     # Note: important step for computing returns correctly w/ loop unroll
@@ -217,12 +120,7 @@ def core_training_loop(
     critic_optimizer.zero_grad()
 
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
-    values_v, action_params_v = net(states_v)
-
-    # Split action parameters back into mean and log_var
-    action_dim = action_params_v.shape[1] // 2
-    action_mean_v = action_params_v[:, :action_dim]
-    action_log_var_v = action_params_v[:, action_dim:]
+    actions_mu_v, actions_logvar_v, values_v = net(states_v)
 
     # Compute current entropy bonus with decay
     entropy_progress = min(1.0, frame_idx / ENTROPY_DECAY_FRAMES)
@@ -245,8 +143,8 @@ def core_training_loop(
     # Gaussian log probability: -0.5 * (log(2π) + log_var + (x-μ)²/σ²)
     log_prob_v = -0.5 * (
         torch.log(torch.tensor(2 * math.pi)) +
-        action_log_var_v +
-        (actions_v - action_mean_v).pow(2) / torch.exp(action_log_var_v)
+        actions_logvar_v +
+        (actions_v - actions_mu_v).pow(2) / torch.exp(actions_logvar_v)
     )
     log_prob_v = log_prob_v.sum(dim=-1)  # Sum over action dimensions
 
@@ -255,12 +153,12 @@ def core_training_loop(
 
     # Entropy bonus for continuous actions
     # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
-    entropy_v = 0.5 * (action_log_var_v + math.log(2 * math.pi * math.e))
+    entropy_v = 0.5 * (actions_logvar_v + math.log(2 * math.pi * math.e))
     entropy_v = entropy_v.sum(dim=-1).mean()  # Sum over action dims, mean over batch
     entropy_bonus_v = current_entropy_beta * entropy_v
 
     # Variance regularization to prevent collapse
-    var_penalty_v = 1e-4 * torch.exp(action_log_var_v).mean()
+    var_penalty_v = 1e-4 * torch.exp(actions_logvar_v).mean()
 
     # Separate loss computation and backpropagation
     # Critic loss (only affects critic network)
@@ -282,8 +180,8 @@ def core_training_loop(
     # Debug - check policy statistics
     if debug and iter_no % 100 == 0:
         with torch.no_grad():
-            mean_action = action_mean_v.mean(dim=0).cpu().numpy()
-            std_action = torch.exp(action_log_var_v / 2).mean(dim=0).cpu().numpy()
+            mean_action = actions_mu_v.mean(dim=0).cpu().numpy()
+            std_action = torch.exp(actions_logvar_v / 2).mean(dim=0).cpu().numpy()
             print(f"Action μ={mean_action[0]:.3f}, σ={std_action[0]:.3f}, entropy_β={current_entropy_beta:.4e}")
 
     # Return loss components for tracking
@@ -305,8 +203,7 @@ def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     """
     _, _ = test_env.reset()  # Use test_env instead of env
     # Use deterministic action selection for evaluation
-    experience_action_selector = ContinuousActionSelector(deterministic=True)
-    agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=False)
+    agent = agents.AgentContinuousA2C(net, deterministic=True)
     exp_source = ptan.experience.ExperienceSourceFirstLast(test_env, agent, gamma=GAMMA)
     reward = 0.0
     episode_count = 0
@@ -352,10 +249,8 @@ if __name__ == "__main__":
         ACTOR_HIDDEN1_DIM, ACTOR_HIDDEN2_DIM
     )
 
-    # Setup the Agent & policy - using continuous action selector
-    experience_action_selector = ContinuousActionSelector(deterministic=False)
-    # Note: network returns (mean, log_var), so we don't apply softmax
-    agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=False)
+    # Setup the Agent & policy - action selection policy built in
+    agent = agents.AgentContinuousA2C(net)
     exp_source = ptan.experience.VectorExperienceSourceFirstLast(vector_env, agent, gamma=GAMMA,
         steps_count=N_TD_STEPS)
 
