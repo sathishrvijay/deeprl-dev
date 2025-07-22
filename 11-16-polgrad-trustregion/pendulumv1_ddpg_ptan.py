@@ -13,7 +13,12 @@ from functools import partial
 from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
-"""This is the implementation of DDPG with Pendulum-v1 RL using the PTAN wrapper libraries."""
+"""This is the implementation of DDPG with Pendulum-v1 RL using the PTAN wrapper libraries.
+TODOs 07/22/25:
+- OU noise implementation for exploration in DDPG model
+- soft target network parameters update
+- update the loss function in core_training_loop()
+"""
 
 # HPARAMS
 RL_ENV = "Pendulum-v1"
@@ -37,13 +42,15 @@ ACTOR_LR_END = 5e-5
 LR_DECAY_FRAMES = 5e7
 
 # PG related - adjusted for continuous actions
-ENTROPY_BONUS_BETA_START = 1e-2  # Higher initial exploration
-ENTROPY_BONUS_BETA_END = 1e-4    # Lower final exploration
-ENTROPY_DECAY_FRAMES = 2e6       # Decay over 2M frames
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # Pendulum success threshold
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
+
+# Replay buffer related
+BATCH_SIZE = 32
+REPLAY_BUFFER_SIZE = 10000
+BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -97,7 +104,8 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
 def core_training_loop(
     net: nn.Module,
-    batch: list,
+    tgt_net: ptan.agent.TargetNet,
+    replay_buffer: ptan.experience.ExperienceReplayBuffer,
     actor_optimizer,
     critic_optimizer,
     actor_scheduler,
@@ -114,46 +122,16 @@ def core_training_loop(
     actor_optimizer.zero_grad()
     critic_optimizer.zero_grad()
 
-    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
-    actions_mu_v, actions_logvar_v, values_v = net(states_v)
-
-    # Compute current entropy bonus with decay
-    entropy_progress = min(1.0, frame_idx / ENTROPY_DECAY_FRAMES)
-    current_entropy_beta = ENTROPY_BONUS_BETA_START * (1 - entropy_progress) + ENTROPY_BONUS_BETA_END * entropy_progress
+    batch = replay_buffer.sample(BATCH_SIZE)
+    states_v, actions_v, target_return_v = unpack_batch(batch, tgt_net.target_model, N_TD_STEPS)
+    actions_mu_v, qvalues_v = net(states_v)
 
     # Critic loss - same as discrete case
     if reward_norm:
         # Pendulum rewards are in [-16, 0] range, so normalize differently than LunarLander
-        values_v = values_v / 16.0
+        qvalues_v = qvalues_v / 16.0
         target_return_v = target_return_v / 16.0
-    critic_loss_v = nn.functional.mse_loss(values_v.squeeze(-1), target_return_v)
-
-    # Compute advantages
-    adv_v = target_return_v - values_v.squeeze(-1).detach()
-    # Normalize advantages
-    adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
-    adv_v = (adv_v - adv_v.mean()) / adv_std
-
-    # Compute log probabilities for continuous actions
-    # Gaussian log probability: -0.5 * (log(2π) + log_var + (x-μ)²/σ²)
-    log_prob_v = -0.5 * (
-        torch.log(torch.tensor(2 * math.pi)) +
-        actions_logvar_v +
-        (actions_v - actions_mu_v).pow(2) / torch.exp(actions_logvar_v)
-    )
-    log_prob_v = log_prob_v.sum(dim=-1)  # Sum over action dimensions
-
-    # Policy gradient loss
-    pg_loss_v = -(adv_v * log_prob_v).mean()
-
-    # Entropy bonus for continuous actions
-    # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
-    entropy_v = 0.5 * (actions_logvar_v + math.log(2 * math.pi * math.e))
-    entropy_v = entropy_v.sum(dim=-1).mean()  # Sum over action dims, mean over batch
-    entropy_bonus_v = current_entropy_beta * entropy_v
-
-    # Variance regularization to prevent collapse
-    var_penalty_v = 1e-4 * torch.exp(actions_logvar_v).mean()
+    critic_loss_v = nn.functional.mse_loss(qvalues_v.squeeze(-1), target_return_v)
 
     # Separate loss computation and backpropagation
     # Critic loss (only affects critic network)
@@ -175,19 +153,14 @@ def core_training_loop(
     # Debug - check policy statistics
     if debug and iter_no % 100 == 0:
         with torch.no_grad():
-            mean_action = actions_mu_v.mean(dim=0).cpu().numpy()
-            std_action = torch.exp(actions_logvar_v / 2).mean(dim=0).cpu().numpy()
-            print(f"Action μ={mean_action[0]:.3f}, σ={std_action[0]:.3f}, entropy_β={current_entropy_beta:.4e}")
+            actions_mu = actions_mu_v.mean(dim=0).cpu().numpy()
+            print(f"Action μ={actions_mu[0]:.3f}")
 
     # Return loss components for tracking
     return {
         'total_loss': total_loss_v.item(),
         'critic_loss': critic_loss_v.item(),
         'actor_loss': actor_loss_v.item(),
-        'entropy_raw': entropy_v.item(),
-        'entropy_loss': entropy_bonus_v.item(),
-        'var_penalty': var_penalty_v.item(),
-        'current_entropy_beta': current_entropy_beta
     }
 
 
@@ -235,7 +208,7 @@ if __name__ == "__main__":
     # don't need a vectorized trial env
     test_env = gym.make(RL_ENV)
 
-    # setup the agent and target net - using continuous action networks
+    # setup the agent and target net
     n_states = vector_env.single_observation_space.shape[0]  # Pendulum has Box(3,) observation space
     n_actions = vector_env.single_action_space.shape[0]      # Pendulum has Box(1,) action space
     net = pgtr_models.DDPG(
@@ -243,11 +216,13 @@ if __name__ == "__main__":
         CRITIC_HIDDEN1_DIM, CRITIC_HIDDEN2_DIM,
         ACTOR_HIDDEN1_DIM, ACTOR_HIDDEN2_DIM
     )
+    tgt_net = ptan.agent.TargetNet(net)
 
-    # Setup the Agent & policy - action selection policy built in
+    # Setup the agent, action policy, experience generation and experience buffer
     agent = agents.AgentContinuousA2C(net)
     exp_source = ptan.experience.VectorExperienceSourceFirstLast(vector_env, agent, gamma=GAMMA,
         steps_count=N_TD_STEPS)
+    replay_buffer = ptan.experience.ExperienceReplayBuffer(exp_source, buffer_size=REPLAY_BUFFER_SIZE)
 
     # Initialize training with performance tracking
     iter_no = 0.0
@@ -286,33 +261,32 @@ if __name__ == "__main__":
         'actor_lr_end': ACTOR_LR_END,
         'lr_decay_frames': LR_DECAY_FRAMES,
         'gamma': GAMMA,
-        'entropy_beta_start': ENTROPY_BONUS_BETA_START,
-        'entropy_beta_end': ENTROPY_BONUS_BETA_END,
-        'entropy_decay_frames': ENTROPY_DECAY_FRAMES,
         'clip_grad': CLIP_GRAD,
         'solved_threshold': PENDULUM_SOLVED_REWARD
     }
     print_training_header(RL_ENV, network_config, hyperparams)
 
-    batch = []
     exp_iterator = iter(exp_source)
     frame_idx = 0  # Track total frames of experience generated
+    # warm start for replay buffer
+    replay_buffer.populate(REPLAY_BUFFER_SIZE)
+    breakpoint()
     while not solved:
         iter_no += 1.0
         iter_start_time = time.time()
-        # Collect experiences from parallel envs for training
-        while len(batch) < batch_size:
-            exp = next(exp_iterator)
-            batch.append(exp)
-        frame_idx += batch_size
+        # Collect experiences every iteration
+        replay_buffer.populate(BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
+        frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
 
         # Training step with separate optimizers
         loss_dict = core_training_loop(
             net, batch, actor_optimizer, critic_optimizer,
             actor_scheduler, critic_scheduler, frame_idx, iter_no
         )
-        batch.clear()
         training_time = time.time() - iter_start_time
+
+        # TODO - add soft sync
+        #tgt_net.sync()
 
         # Print periodic performance summary every 500 iterations
         if iter_no % 10000 == 0:
@@ -343,10 +317,6 @@ if __name__ == "__main__":
                 f"losses: total={loss_dict['total_loss']:.4f}, "
                 f"critic={loss_dict['critic_loss']:.4f}, "
                 f"actor={loss_dict['actor_loss']:.4f}, "
-                f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
-                f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
-                f"var_penalty={loss_dict['var_penalty']:.4e}, "
-                f"entropy_β={loss_dict['current_entropy_beta']:.4e}"
             )
 
         solved = average_return > PENDULUM_SOLVED_REWARD  # Pendulum is solved when avg reward > -200
