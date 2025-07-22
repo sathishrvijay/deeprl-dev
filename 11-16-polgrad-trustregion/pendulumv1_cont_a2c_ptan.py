@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import time
+import math
 from datetime import datetime, timedelta
 
 import typing as tt
@@ -13,14 +14,111 @@ from functools import partial
 from models import pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
-"""This is the implementation of A2C with LunarLander-v2 RL using the PTAN wrapper libraries.
+
+class ContinuousActionSelector(ptan.actions.ActionSelector):
+    """Custom action selector for continuous actions that samples from Gaussian policy."""
+
+    def __init__(self, deterministic: bool = False):
+        self.deterministic = deterministic
+
+    def __call__(self, scores):
+        """
+        Args:
+            scores: concatenated numpy array of [action_mean, action_log_var]
+                   Can be either:
+                   - Single env: shape (2*action_dim,) 
+                   - Batch: shape (batch_size, 2*action_dim)
+        Returns:
+            numpy array of sampled actions
+        """
+        # Work directly with numpy arrays since PTAN always passes numpy
+        if not isinstance(scores, np.ndarray):
+            scores = scores.cpu().data.numpy()  # Convert tensor to numpy if needed
+        
+        # Debug: Print what we're actually receiving
+        print(f"🔍 Action selector received: shape={scores.shape}, dtype={scores.dtype}")
+        if scores.size > 0:
+            print(f"🔍 First few values: {scores.flatten()[:4]}")
+        
+        # EMERGENCY FIX: If we're getting wrong shape, try to handle it gracefully
+        if scores.shape == (16, 1) or (len(scores.shape) == 2 and scores.shape[1] == 1):
+            print(f"⚠️  WARNING: Received unexpected shape {scores.shape}")
+            print(f"⚠️  This suggests PTAN is passing values instead of action parameters")
+            print(f"⚠️  Using fallback: treating input as action mean, using default log_var")
+            
+            # Use the received values as action mean, add default log_var
+            action_mean = scores
+            action_log_var = np.full_like(action_mean, -1.0)  # Default log_var = -1 (std ≈ 0.6)
+            
+            if self.deterministic:
+                actions = action_mean
+            else:
+                std = np.exp(action_log_var / 2)
+                eps = np.random.randn(*std.shape)
+                actions = action_mean + std * eps
+            
+            # Clip actions to Pendulum bounds [-2, 2]
+            actions = np.clip(actions, -2.0, 2.0)
+            
+            # Return correct format for vectorized environment
+            if actions.shape[0] > 1:  # Batch case
+                return actions  # Shape: (batch_size, 1)
+            else:  # Single environment case
+                return actions.flatten()  # Shape: (1,)
+        
+        # NORMAL PROCESSING: Handle correct input format
+        # Handle single environment case (1D array)
+        if scores.ndim == 1:
+            scores = scores.reshape(1, -1)  # Convert to batch format
+            single_env = True
+        else:
+            single_env = False
+        
+        # Handle edge case where scores might be empty or malformed
+        if scores.size == 0:
+            print(f"❌ ERROR: Empty scores array received in action selector")
+            return np.array([0.0])  # Return scalar for single env
+        
+        # Split the concatenated array back into mean and log_var
+        batch_size = scores.shape[0]
+        if len(scores.shape) < 2:
+            print(f"❌ ERROR: Scores has wrong dimensions: {scores.shape}")
+            return np.array([0.0])
+            
+        action_dim = scores.shape[1] // 2
+        
+        if action_dim == 0:
+            print(f"❌ ERROR: Invalid action_dim=0, scores shape: {scores.shape}")
+            print(f"❌ This means scores.shape[1]={scores.shape[1]}, so action_dim={scores.shape[1]}//2=0")
+            print(f"❌ Expected scores.shape[1] to be 2 for Pendulum (mean + log_var)")
+            return np.array([0.0])
+        
+        action_mean = scores[:, :action_dim]
+        action_log_var = scores[:, action_dim:]
+        
+        if self.deterministic:
+            actions = action_mean
+        else:
+            # Use numpy operations instead of PyTorch
+            std = np.exp(action_log_var / 2)
+            eps = np.random.randn(*std.shape)
+            actions = action_mean + std * eps
+        
+        # For single environment, return 1D array (what Pendulum expects)
+        if single_env:
+            return actions.flatten()  # Convert (1, 1) -> (1,) for Pendulum
+        
+        return actions
+
+"""This is the implementation of A2C with Pendulum-v1 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
 PG methods like A3C, DDPG, SAC, PPO and others.
 Modified to use separate Actor and Critic networks with different optimizers and learning rates.
+Adapted for continuous action spaces using Gaussian policies with log variance parameterization.
 """
 
 # HPARAMS
-RL_ENV = "LunarLander-v2"
+RL_ENV = "Pendulum-v1"
 N_ENVS = 16
 
 # Separate network dimensions
@@ -32,7 +130,7 @@ ACTOR_HIDDEN2_DIM = 64
 N_TD_STEPS = 4 # Number of steps aggregated per experience (n in n-step TD)
 N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
 
-GAMMA = 0.995
+GAMMA = 0.99  # Slightly lower for Pendulum's shorter episodes
 # Separate learning rates for actor and critic
 CRITIC_LR_START = 7e-4
 CRITIC_LR_END = 1e-4
@@ -40,20 +138,26 @@ ACTOR_LR_START = 3e-4
 ACTOR_LR_END = 5e-5
 LR_DECAY_FRAMES = 5e7
 
-# PG related
-MAX_LOGIT = 10.0
-ENTROPY_BONUS_BETA = 5e-2
+# PG related - adjusted for continuous actions
+ENTROPY_BONUS_BETA_START = 1e-2  # Higher initial exploration
+ENTROPY_BONUS_BETA_END = 1e-4    # Lower final exploration
+ENTROPY_DECAY_FRAMES = 2e6       # Decay over 2M frames
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
+
+# Pendulum success threshold
+PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
-    net: ptan.agent.NNAgent,
+    net: nn.Module,
     n_steps: int
     ):
     """Note: Since in general an experience sub-trajectory can be n-steps,
     the terminology used here is last state instead of next state.
     Additionally, reward is equal to the cumulative discounted rewards from intermediate steps
-    All of this is subsumed within ptan.experience.ExperienceFirstLast"""
+    All of this is subsumed within ptan.experience.ExperienceFirstLast
+    Modified for continuous actions - actions are now continuous values instead of discrete indices.
+    """
     states = []
     actions = []
     rewards = []
@@ -73,9 +177,10 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
     # Array stacking during conv should work by default, but direct conversion from list of numpy array
     # to tensor is very slow, hence the np.stack(...)
-    actions_v, rewards_v = torch.tensor(actions), torch.tensor(rewards, dtype=torch.float32)
-    states_v, last_states_v = \
-        torch.tensor(np.stack(states), dtype=torch.float32), torch.tensor(np.stack(last_states), dtype=torch.float32)
+    actions_v = torch.tensor(np.stack(actions), dtype=torch.float32)  # Continuous actions are float
+    rewards_v = torch.tensor(rewards, dtype=torch.float32)
+    states_v = torch.tensor(np.stack(states), dtype=torch.float32)
+    last_states_v = torch.tensor(np.stack(last_states), dtype=torch.float32)
 
     # return states, actions, returns
     with torch.no_grad():
@@ -99,50 +204,63 @@ def core_training_loop(
     critic_optimizer,
     actor_scheduler,
     critic_scheduler,
+    frame_idx: int,
     iter_no=None,
     reward_norm=True,
     debug=True
     ):
     """In A2C, the entire generated batch of episodes is used for training in every epoch.
-    Note: Actor head returns logits
+    Modified for continuous actions using Gaussian policy with log variance parameterization.
     Returns: Dictionary containing loss components for tracking
     """
     actor_optimizer.zero_grad()
     critic_optimizer.zero_grad()
 
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
-    values_v, action_logits_v = net(states_v)
-    # To prevent soft max pushing policy to be deterministic very fast. Don't using clamping as it kills gradients
-    action_probas_v = nn.functional.softmax(action_logits_v, dim=1)
-    log_action_probas_v = nn.functional.log_softmax(action_logits_v, dim=1)
+    values_v, action_params_v = net(states_v)
 
-    # loss = mse_loss + pg_gain + entropy_bonus
+    # Split action parameters back into mean and log_var
+    action_dim = action_params_v.shape[1] // 2
+    action_mean_v = action_params_v[:, :action_dim]
+    action_log_var_v = action_params_v[:, action_dim:]
+
+    # Compute current entropy bonus with decay
+    entropy_progress = min(1.0, frame_idx / ENTROPY_DECAY_FRAMES)
+    current_entropy_beta = ENTROPY_BONUS_BETA_START * (1 - entropy_progress) + ENTROPY_BONUS_BETA_END * entropy_progress
+
+    # Critic loss - same as discrete case
     if reward_norm:
-        values_v = values_v / 200.0
-        target_return_v = target_return_v / 200.0
+        # Pendulum rewards are in [-16, 0] range, so normalize differently than LunarLander
+        values_v = values_v / 16.0
+        target_return_v = target_return_v / 16.0
     critic_loss_v = nn.functional.mse_loss(values_v.squeeze(-1), target_return_v)
 
-    # Key notes for PG loss calc -
-    # 1. detach values_v to prevent propagating PG loss into Critic network
-    # 2. Normalize advantage for the batch (suggested by o3 to avoid learning plateaus)
-    # 3. Gather probas only for the selected actions for PG loss
-    # 4. Don't forget the negative sign for gradient ascent
+    # Compute advantages
     adv_v = target_return_v - values_v.squeeze(-1).detach()
-    # Normalize adv
+    # Normalize advantages
     adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
     adv_v = (adv_v - adv_v.mean()) / adv_std
 
-    log_actions_v = log_action_probas_v.gather(dim=1, index=actions_v.unsqueeze(1)).squeeze(-1)
-    pg_loss_v = -(adv_v * log_actions_v).mean()
+    # Compute log probabilities for continuous actions
+    # Gaussian log probability: -0.5 * (log(2π) + log_var + (x-μ)²/σ²)
+    log_prob_v = -0.5 * (
+        torch.log(torch.tensor(2 * math.pi)) +
+        action_log_var_v +
+        (actions_v - action_mean_v).pow(2) / torch.exp(action_log_var_v)
+    )
+    log_prob_v = log_prob_v.sum(dim=-1)  # Sum over action dimensions
 
-    # Note: Entropy is a bonus, non uniform distribution should increase loss
-    entropy_v = -(action_probas_v * log_action_probas_v).sum(dim=1).mean()
-    entropy_bonus_v = ENTROPY_BONUS_BETA * entropy_v
+    # Policy gradient loss
+    pg_loss_v = -(adv_v * log_prob_v).mean()
 
-    # To prevent soft max pushing policy to be deterministic very fast.
-    # Don't using clamping as it kills gradients
-    soft_penalty_v = 1e-4 * ((action_logits_v / MAX_LOGIT).tanh() * MAX_LOGIT
-        - action_logits_v).pow(2).mean()
+    # Entropy bonus for continuous actions
+    # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
+    entropy_v = 0.5 * (action_log_var_v + math.log(2 * math.pi * math.e))
+    entropy_v = entropy_v.sum(dim=-1).mean()  # Sum over action dims, mean over batch
+    entropy_bonus_v = current_entropy_beta * entropy_v
+
+    # Variance regularization to prevent collapse
+    var_penalty_v = 1e-4 * torch.exp(action_log_var_v).mean()
 
     # Separate loss computation and backpropagation
     # Critic loss (only affects critic network)
@@ -152,7 +270,7 @@ def core_training_loop(
     critic_scheduler.step()
 
     # Actor loss (only affects actor network)
-    actor_loss_v = pg_loss_v - entropy_bonus_v + soft_penalty_v
+    actor_loss_v = pg_loss_v - entropy_bonus_v + var_penalty_v
     actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(net.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
@@ -161,10 +279,12 @@ def core_training_loop(
     # Total loss for logging (not used for backprop)
     total_loss_v = critic_loss_v + actor_loss_v
 
-    # Debug - check policy & gradient norms
+    # Debug - check policy statistics
     if debug and iter_no % 100 == 0:
-        probas = action_probas_v.mean(dim=0).cpu().detach().numpy()
-        print(f"π = {np.round(probas, 3)}")    # e.g. π = [0.26 0.24 0.29 0.21]
+        with torch.no_grad():
+            mean_action = action_mean_v.mean(dim=0).cpu().numpy()
+            std_action = torch.exp(action_log_var_v / 2).mean(dim=0).cpu().numpy()
+            print(f"Action μ={mean_action[0]:.3f}, σ={std_action[0]:.3f}, entropy_β={current_entropy_beta:.4e}")
 
     # Return loss components for tracking
     return {
@@ -173,17 +293,20 @@ def core_training_loop(
         'actor_loss': actor_loss_v.item(),
         'entropy_raw': entropy_v.item(),
         'entropy_loss': entropy_bonus_v.item(),
-        'logit_penalty': soft_penalty_v.item()
+        'var_penalty': var_penalty_v.item(),
+        'current_entropy_beta': current_entropy_beta
     }
 
 
 def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     """Note that we want a separate env for trials that doesn't mess with training env.
-    We might want to use a deterministic agent that makes the most probable moves for eval.
+    We use deterministic actions (mean only) for evaluation to get consistent performance measurement.
+    Modified for continuous actions.
     """
     _, _ = test_env.reset()  # Use test_env instead of env
-    experience_action_selector = ptan.actions.ArgmaxActionSelector()
-    agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
+    # Use deterministic action selection for evaluation
+    experience_action_selector = ContinuousActionSelector(deterministic=True)
+    agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=False)
     exp_source = ptan.experience.ExperienceSourceFirstLast(test_env, agent, gamma=GAMMA)
     reward = 0.0
     episode_count = 0
@@ -215,26 +338,24 @@ if __name__ == "__main__":
     # - Simulate trials & train until convergence
 
     # setup the parallel environment collection
-    # env = gym.make(RL_ENV)
     env_fns = [partial(gym.make, RL_ENV) for _ in range(N_ENVS)]
     vector_env = gym.vector.SyncVectorEnv(env_fns)
     # don't need a vectorized trial env
     test_env = gym.make(RL_ENV)
 
-    # setup the agent and target net - using separate actor-critic networks
-    n_states = vector_env.single_observation_space.shape[0]  # LunarLander has Box(8,) observation space
-    n_actions = vector_env.single_action_space.n
-    net = pgtr_models.A2CDiscreteActionSeparate(
+    # setup the agent and target net - using continuous action networks
+    n_states = vector_env.single_observation_space.shape[0]  # Pendulum has Box(3,) observation space
+    n_actions = vector_env.single_action_space.shape[0]      # Pendulum has Box(1,) action space
+    net = pgtr_models.ContinuousA2C(
         n_states, n_actions,
         CRITIC_HIDDEN1_DIM, CRITIC_HIDDEN2_DIM,
         ACTOR_HIDDEN1_DIM, ACTOR_HIDDEN2_DIM
     )
 
-    # Setup the Agent & policy
-    experience_action_selector = ptan.actions.ProbabilityActionSelector()
-    # Note: network returns logits, so we need to apply softmax before
-    # stochastically sampling actions
-    agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=True)
+    # Setup the Agent & policy - using continuous action selector
+    experience_action_selector = ContinuousActionSelector(deterministic=False)
+    # Note: network returns (mean, log_var), so we don't apply softmax
+    agent = ptan.agent.ActorCriticAgent(net, experience_action_selector, apply_softmax=False)
     exp_source = ptan.experience.VectorExperienceSourceFirstLast(vector_env, agent, gamma=GAMMA,
         steps_count=N_TD_STEPS)
 
@@ -263,7 +384,7 @@ if __name__ == "__main__":
 
     # Initialize performance tracker and print training header
     perf_tracker = PerformanceTracker()
-    network_config = f"Separate A2C: Critic({CRITIC_HIDDEN1_DIM}-{CRITIC_HIDDEN2_DIM}), Actor({ACTOR_HIDDEN1_DIM}-{ACTOR_HIDDEN2_DIM})"
+    network_config = f"Continuous A2C: Critic({CRITIC_HIDDEN1_DIM}-{CRITIC_HIDDEN2_DIM}), Actor({ACTOR_HIDDEN1_DIM}-{ACTOR_HIDDEN2_DIM})"
     hyperparams = {
         'n_envs': N_ENVS,
         'n_td_steps': N_TD_STEPS,
@@ -275,8 +396,11 @@ if __name__ == "__main__":
         'actor_lr_end': ACTOR_LR_END,
         'lr_decay_frames': LR_DECAY_FRAMES,
         'gamma': GAMMA,
-        'entropy_beta': ENTROPY_BONUS_BETA,
-        'clip_grad': CLIP_GRAD
+        'entropy_beta_start': ENTROPY_BONUS_BETA_START,
+        'entropy_beta_end': ENTROPY_BONUS_BETA_END,
+        'entropy_decay_frames': ENTROPY_DECAY_FRAMES,
+        'clip_grad': CLIP_GRAD,
+        'solved_threshold': PENDULUM_SOLVED_REWARD
     }
     print_training_header(RL_ENV, network_config, hyperparams)
 
@@ -296,7 +420,7 @@ if __name__ == "__main__":
         # Training step with separate optimizers
         loss_dict = core_training_loop(
             net, batch, actor_optimizer, critic_optimizer,
-            actor_scheduler, critic_scheduler, iter_no
+            actor_scheduler, critic_scheduler, frame_idx, iter_no
         )
         batch.clear()
         training_time = time.time() - iter_start_time
@@ -332,10 +456,11 @@ if __name__ == "__main__":
                 f"actor={loss_dict['actor_loss']:.4f}, "
                 f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
                 f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
-                f"logit_penalty={loss_dict['logit_penalty']:.4e}"
+                f"var_penalty={loss_dict['var_penalty']:.4e}, "
+                f"entropy_β={loss_dict['current_entropy_beta']:.4e}"
             )
 
-        solved = average_return > 200.0  # LunarLander is considered solved at 200+ average reward
+        solved = average_return > PENDULUM_SOLVED_REWARD  # Pendulum is solved when avg reward > -200
 
     # Training completed - print comprehensive summary using utility function
     final_summary = perf_tracker.get_summary()
@@ -344,7 +469,7 @@ if __name__ == "__main__":
     print_final_summary(
         solved=solved,
         average_return=average_return,
-        target_reward=200.0,
+        target_reward=PENDULUM_SOLVED_REWARD,
         final_summary=final_summary,
         frame_idx=frame_idx,
         current_alpha=f"critic:{critic_lr:.2e}, actor:{actor_lr:.2e}",
