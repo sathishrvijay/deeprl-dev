@@ -163,7 +163,7 @@ def core_training_loop(
     tgt_net.alpha_sync(alpha=1 - 5e-3)
 
     # Debug - check policy statistics
-    if debug and iter_no % 10 == 0:
+    if debug and iter_no % 100 == 0:
         with torch.no_grad():
             current_actions_v = current_actions_v.mean(dim=0).cpu().numpy()
             print(f"Action μ={current_actions_v[0]:.3f}")
@@ -317,7 +317,7 @@ if __name__ == "__main__":
             int(iter_no), frame_idx, average_return, training_time, eval_time, loss_dict
         )
 
-        if iter_no % 10 == 0:
+        if iter_no % 100 == 0:
             # Enhanced logging with timing information and separate learning rates
             critic_lr = critic_optimizer.param_groups[0]["lr"]
             actor_lr = actor_optimizer.param_groups[0]["lr"]

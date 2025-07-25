@@ -43,13 +43,13 @@ class AgentDDPG(ptan.agent.BaseAgent):
         if self.deterministic:
             new_agent_states = agent_states
         else:
+            if agent_states is None:
+                agent_states = np.zeros(shape=actions.shape, dtype=np.float32)
             # Implement OU noise
             new_agent_states = []
             for a_state, action in zip(agent_states, actions):
-                if a_state is None:
-                    a_state = np.zeros(shape=action.shape, dtype=np.float32)
-                a_state += self.ou_teta * (self.ou_mu - a_state)
+                a_state += self.ou_theta * (self.ou_mu - a_state)
                 a_state += self.ou_sigma * np.random.normal(size=action.shape)
-                action += self.ou_epsilon * a_state
+                action += self.ou_eps * a_state
                 new_agent_states.append(a_state)
         return actions, new_agent_states
