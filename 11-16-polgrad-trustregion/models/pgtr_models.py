@@ -235,6 +235,7 @@ class DDPGCritic(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, actions: torch.Tensor):
+        # returns Q(s, a)
         x = self.state_stack(x)
         return self.actionvalue_stack(torch.concat((x, actions), dim=-1))
 
@@ -249,6 +250,7 @@ class DDPG(nn.Module):
         self.critic = DDPGCritic(state_dim, action_dim, critic_hidden1_dim, critic_hidden2_dim)
         self.actor = DDPGActor(state_dim, action_dim, actor_hidden1_dim, actor_hidden2_dim)
 
+
     def forward(self, x: torch.Tensor):
         actions_mean = self.actor(x)
         qvalue = self.critic(x, actions_mean)
@@ -258,12 +260,13 @@ class DDPG(nn.Module):
         """Sample action from the policy. Used for evaluation and action selection."""
         with torch.no_grad():
             actions_mean = self.actor(state)
+            return actions_mean
 
-            if deterministic:
-                return actions_mean
-            else:
-                # TODO: Implement OU noise
-                return actions_mean
+    def get_critic_net(self):
+        return self.critic
+
+    def get_actor_net(self):
+        return self.actor
 
     def get_actor_parameters(self):
         return self.actor.parameters()
