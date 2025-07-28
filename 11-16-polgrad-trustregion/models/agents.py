@@ -28,7 +28,7 @@ class AgentDDPG(ptan.agent.BaseAgent):
     [vs] I have not understood the math or intuition for OU, implementing as is."""
     def __init__(self, net, deterministic=False,
                  ou_mu: float = 0.0, ou_theta: float = 0.15,
-                 ou_sigma: float = 0.2, ou_epsilon: float = 10):
+                 ou_sigma: float = 0.1, ou_epsilon: float = 1.0):
         self.net = net
         self.deterministic = deterministic
         self.ou_mu = ou_mu

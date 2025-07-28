@@ -33,11 +33,11 @@ N_TD_STEPS = 4 # Number of steps aggregated per experience (n in n-step TD)
 N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
 
 GAMMA = 0.99  # Slightly lower for Pendulum's shorter episodes
-# Separate learning rates for actor and critic
-CRITIC_LR_START = 7e-4
+# Separate learning rates for actor and critic - reduced for stability
+CRITIC_LR_START = 1e-3
 CRITIC_LR_END = 1e-4
-ACTOR_LR_START = 3e-4
-ACTOR_LR_END = 5e-5
+ACTOR_LR_START = 1e-4
+ACTOR_LR_END = 1e-5
 LR_DECAY_FRAMES = 5e7
 
 # PG related - adjusted for continuous actions
@@ -131,15 +131,24 @@ def core_training_loop(
     # Q(s, a) <- from collected experience on main net (because of partial SGD)
     critic_net = tgt_net.model.get_critic_net()
     qvalues_v = critic_net(states_v, actions_v)
+
     if reward_norm:
-        # Pendulum rewards are in [-16, 0] range, so normalize differently than LunarLander
-        qvalues_v = qvalues_v / 16.0
-        target_return_v = target_return_v / 16.0
-    critic_loss_v = nn.functional.mse_loss(qvalues_v.squeeze(-1), target_return_v)
+        critic_loss_v = \
+            nn.functional.mse_loss(qvalues_v.squeeze(-1) / 16.0, target_return_v / 16.0)
+    else:
+        critic_loss_v = nn.functional.mse_loss(qvalues_v.squeeze(-1), target_return_v)
+
+    # Safety check for NaN/Inf values
+    if torch.isnan(critic_loss_v) or torch.isinf(critic_loss_v):
+        print(f"WARNING: Invalid critic loss detected: {critic_loss_v.item()}")
+        print(f"Q-values: min={qvalues_v.min():.4f}, max={qvalues_v.max():.4f}")
+        print(f"Targets: min={target_return_v.min():.4f}, max={target_return_v.max():.4f}")
+        return {'total_loss': 0.0, 'critic_loss': 0.0, 'actor_loss': 0.0}
 
     # Critic loss (only affects critic network)
+    critic_params = tgt_net.model.get_critic_parameters()
     critic_loss_v.backward()
-    torch.nn.utils.clip_grad_norm_(net.get_critic_parameters(), CLIP_GRAD)
+    torch.nn.utils.clip_grad_norm_(critic_params, CLIP_GRAD)
     critic_optimizer.step()
     critic_scheduler.step()
 
@@ -148,10 +157,19 @@ def core_training_loop(
     current_actions_v = actor_net(states_v)
     actor_loss_v = -critic_net(states_v, current_actions_v)
     actor_loss_v = actor_loss_v.mean()
+
+    # freeze critic for actor update (to avoid actor poisoning critic)
+    for p in critic_params:
+        p.requires_grad_(False)
+
     actor_loss_v.backward()
-    torch.nn.utils.clip_grad_norm_(net.get_actor_parameters(), CLIP_GRAD)
+    torch.nn.utils.clip_grad_norm_(tgt_net.model.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
     actor_scheduler.step()
+
+    # unfreeze critic
+    for p in critic_params:
+        p.requires_grad_(True)
 
     # Total loss for logging (not used for backprop)
     total_loss_v = critic_loss_v + actor_loss_v
@@ -160,13 +178,15 @@ def core_training_loop(
     # ptan uses alpha = 1 - tau
     # literature calls this param tau; GPT suggests tau <- 0.005
     # wT = (1 - tau) *wT + tau *w
-    tgt_net.alpha_sync(alpha=1 - 5e-3)
+    tgt_net.alpha_sync(alpha=0.995)
 
-    # Debug - check policy statistics
+    # Debug - check policy statistics and loss values
     if debug and iter_no % 100 == 0:
         with torch.no_grad():
             current_actions_v = current_actions_v.mean(dim=0).cpu().numpy()
-            print(f"Action μ={current_actions_v[0]:.3f}")
+            print(f"Action μ={current_actions_v[0]:.3f}, "
+                  f"Q-val range=[{qvalues_v.min():.2f}, {qvalues_v.max():.2f}], "
+                  f"Target range=[{target_return_v.min():.2f}, {target_return_v.max():.2f}]")
 
     # Return loss components for tracking
     return {
