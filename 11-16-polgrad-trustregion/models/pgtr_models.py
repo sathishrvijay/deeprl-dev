@@ -199,8 +199,13 @@ class ContinuousA2C(nn.Module):
 
 class DDPGActor(nn.Module):
     """Actor network in DDPG is deterministic (unlike CA A2C and PPO)"""
-    def __init__(self, state_dim: int, action_dim: int, hidden1_dim: int = 128, hidden2_dim: int = 64):
+    def __init__(self, state_dim: int,
+                 action_dim: int,
+                 hidden1_dim: int = 128,
+                 hidden2_dim: int = 64,
+                 action_scale = 2.0):
         super(DDPGActor, self).__init__()
+        self.action_scale = action_scale
 
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden1_dim),
@@ -214,7 +219,7 @@ class DDPGActor(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # tanh scaling to action bounds [-2, 2] for Pendulum
-        actions_mu = torch.tanh(self.network(x)) * 2.0
+        actions_mu = torch.tanh(self.network(x)) * self.action_scale
         return actions_mu
 
 

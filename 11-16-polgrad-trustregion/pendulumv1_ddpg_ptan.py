@@ -52,10 +52,7 @@ REPLAY_BUFFER_SIZE = 10000
 BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 
 
-def unpack_batch_ddqn(batch: tt.List[ptan.experience.ExperienceFirstLast],
-    net: nn.Module,
-    n_steps: int
-    ):
+def unpack_batch_ddqn(batch: tt.List[ptan.experience.ExperienceFirstLast]):
     """
     Note: unpacking batch is different for DDQN because Q(s', a') and therefore
     target return is only available online during training
@@ -115,7 +112,7 @@ def core_training_loop(
 
     batch = replay_buffer.sample(BATCH_SIZE)
     states_v, actions_v, target_return_v, last_states_v, done_masks_v = \
-        unpack_batch_ddqn(batch, tgt_net.target_model, N_TD_STEPS)
+        unpack_batch_ddqn(batch)
 
     # Note: Separate loss computation and backpropagation for Critic and Actor
     # Critic loss: MSE(r + gamma * QT(s', muT(s)) - Q(s, a)); T <- Target net
@@ -124,7 +121,7 @@ def core_training_loop(
     ls_actions_mu_v, ls_qvalues_v = target_net(last_states_v)
     ls_qvalues_v = ls_qvalues_v.squeeze(1).data
     ls_qvalues_v *= GAMMA ** N_TD_STEPS
-    # zero out the terminated episodes
+    # zero out if s' is a terminal state
     ls_qvalues_v[done_masks_v] = 0.0
     target_return_v += ls_qvalues_v
 
@@ -152,24 +149,29 @@ def core_training_loop(
     critic_optimizer.step()
     critic_scheduler.step()
 
-    # Actor loss: Invert sign and propagate back from Critic
+    # Actor loss:
+    # freeze critic for actor update (to avoid actor poisoning critic)
+    # NOTE: You could unfreeze after backward(), but wastes memory and computation
+    # We need gradients to flow thru the critic to actions, but it does not need
+    # gradients wrt. to critics own weights
+    # for p in critic_params:
+    #     p.requires_grad_(False)
+
     actor_net = tgt_net.model.get_actor_net()
     current_actions_v = actor_net(states_v)
-    actor_loss_v = -critic_net(states_v, current_actions_v)
-    actor_loss_v = actor_loss_v.mean()
-
-    # freeze critic for actor update (to avoid actor poisoning critic)
-    for p in critic_params:
-        p.requires_grad_(False)
-
-    actor_loss_v.backward()
+    # Invert sign and propagate back from Critic
+    if reward_norm:
+        actor_loss_v = -critic_net(states_v, current_actions_v).mean() / 16.0
+    else:
+        actor_loss_v = -critic_net(states_v, current_actions_v).mean()
+    actor_loss_v.backward(retain_graph=True)
     torch.nn.utils.clip_grad_norm_(tgt_net.model.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
     actor_scheduler.step()
 
-    # unfreeze critic
-    for p in critic_params:
-        p.requires_grad_(True)
+    # # unfreeze critic
+    # for p in critic_params:
+    #     p.requires_grad_(True)
 
     # Total loss for logging (not used for backprop)
     total_loss_v = critic_loss_v + actor_loss_v
@@ -308,6 +310,7 @@ if __name__ == "__main__":
         iter_start_time = time.time()
         # Collect experiences every iteration
         replay_buffer.populate(BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
+        agent.decay_ou_eps()
         frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
 
         # Training step with separate optimizers
