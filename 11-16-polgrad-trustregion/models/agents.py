@@ -40,30 +40,39 @@ class AgentDDPG(ptan.agent.BaseAgent):
         self.ou_eps_decay = ou_eps_decay
 
     def decay_ou_eps(self):
-        # Decay EPS to lower exploration later
+        """Progressively decay EPS over an episode to lower exploration."""
         self.ou_eps *= self.ou_eps_decay
 
-    def __call__(self, states: ptan.agent.States, agent_states: ptan.agent.AgentStates):
+    def __call__(self, states: ptan.agent.States, noise_states: ptan.agent.AgentStates):
+        """Leverage PTAN's internal state aka AgentStates (different from env states) to
+        maintain the OU noise state. This OU noise will be used to perturb the Actor's action
+        before passing it to the env for experience collection.
+        OU noise is temporally correlated and preferred to random noise for smoother
+        exploration in CA envs.
+        NOTE: Actor net is stateless, therefore this state is stored in the Agent wrapper.
+        NOTE: OU epsilon is reset at the end of an episode
+        """
         states_v = ptan.agent.float32_preprocessor(states)
         actions = self.net.sample_action(states_v).cpu().numpy()
 
         if self.deterministic:
-            new_agent_states = agent_states
+            new_noise_states = noise_states
         else:
             # An OU noise process is a stateful recursion
             # x_{t+1} = x_t + theta * (mu - x_t) + sigma * mathcal N(0,1)
-            if agent_states is None:
+            # action' = action + eps * x_{t+1}
+            if noise_states is None:
                 # reset epsilon whenever episode terminates and new one begins
                 self.ou_eps = self.ou_eps_init
-                agent_states = [np.zeros(action.shape, np.float32) for action in actions]
-            # Implement OU noise
-            new_agent_states = []
-            for idx, (a_state, action) in enumerate(zip(agent_states, actions)):
-                a_state += self.ou_theta * (self.ou_mu - a_state)
-                a_state += self.ou_sigma * np.random.normal(size=action.shape)
-                action += self.ou_eps * a_state
-                # stay w/in -2.0 to 2.0 for pendulum after OU noise added
-                actions[idx] = np.clip(action, -2.0, 2.0)
-                new_agent_states.append(a_state.copy())
+                noise_states = [np.zeros(action.shape, np.float32) for action in actions]
 
-        return actions, new_agent_states
+            new_noise_states = []
+            for idx, (xt, action) in enumerate(zip(noise_states, actions)):
+                xt += self.ou_theta * (self.ou_mu - xt)
+                xt += self.ou_sigma * np.random.normal(size=action.shape)
+                action += self.ou_eps * xt
+                # stay w/in [-2.0, 2.0] for pendulum action after OU noise added
+                actions[idx] = np.clip(action, -2.0, 2.0)
+                new_noise_states.append(xt.copy())
+
+        return actions, new_noise_states

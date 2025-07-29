@@ -45,7 +45,7 @@ CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # Pendulum success threshold
 RNORM_SCALE_FACTOR = 5.0  # reward normalization scale factor
-ACTION_PENALTY_COEF = 0.005   #prevents actor from going to max torque
+ACTION_PENALTY_COEF = 0.01   #prevents actor from going to max torque
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
 # Replay buffer related
@@ -153,9 +153,9 @@ def core_training_loop(
     critic_scheduler.step()
 
     # Actor loss:
-    # freeze critic for actor update (to avoid actor poisoning critic)
-    # NOTE: You could unfreeze after backward(), but wastes memory and computation
-    # We need gradients to flow thru the critic to actions, but it does not need
+    # Actor's optimizer only updates actor weights, so freezing critic weights is purely
+    # for memory and compute efficiency, not functionally required for correctness
+    # Note: We need gradients to flow thru the critic to actions, but it does not need
     # gradients wrt. to critics own weights
     for p in critic_params:
         p.requires_grad_(False)
@@ -171,7 +171,7 @@ def core_training_loop(
     # NOTE: Add action penalty to limit to smaller torque values and avoid reward hacking
     actor_loss_v += ACTION_PENALTY_COEF * (current_actions_v ** 2).mean()
 
-    actor_loss_v.backward(retain_graph=True)
+    actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(tgt_net.model.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
     actor_scheduler.step()
