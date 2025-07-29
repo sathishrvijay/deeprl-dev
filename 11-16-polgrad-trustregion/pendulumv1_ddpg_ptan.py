@@ -21,7 +21,7 @@ TODOs 07/22/25:
 
 # HPARAMS
 RL_ENV = "Pendulum-v1"
-N_ENVS = 16
+N_ENVS = 8
 
 # Separate network dimensions
 CRITIC_HIDDEN1_DIM = 128
@@ -36,7 +36,7 @@ GAMMA = 0.99  # Slightly lower for Pendulum's shorter episodes
 # Separate learning rates for actor and critic - reduced for stability
 CRITIC_LR_START = 1e-3
 CRITIC_LR_END = 1e-4
-ACTOR_LR_START = 1e-4
+ACTOR_LR_START = 3e-5
 ACTOR_LR_END = 1e-5
 LR_DECAY_FRAMES = 5e7
 
@@ -44,11 +44,13 @@ LR_DECAY_FRAMES = 5e7
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # Pendulum success threshold
+RNORM_SCALE_FACTOR = 5.0  # reward normalization scale factor
+ACTION_PENALTY_COEF = 0.005   #prevents actor from going to max torque
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
 # Replay buffer related
 BATCH_SIZE = 32
-REPLAY_BUFFER_SIZE = 10000
+REPLAY_BUFFER_SIZE = 5000
 BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 
 
@@ -118,12 +120,12 @@ def core_training_loop(
     # Critic loss: MSE(r + gamma * QT(s', muT(s)) - Q(s, a)); T <- Target net
     # s' <- from collected experience
     target_net = tgt_net.target_model
-    ls_actions_mu_v, ls_qvalues_v = target_net(last_states_v)
-    ls_qvalues_v = ls_qvalues_v.squeeze(1).data
-    ls_qvalues_v *= GAMMA ** N_TD_STEPS
-    # zero out if s' is a terminal state
-    ls_qvalues_v[done_masks_v] = 0.0
-    target_return_v += ls_qvalues_v
+    with torch.no_grad():
+        ls_qvalues_v = target_net(last_states_v)[1].squeeze(1).data
+        ls_qvalues_v *= GAMMA ** N_TD_STEPS
+        # zero out if s' is a terminal state
+        ls_qvalues_v[done_masks_v] = 0.0
+        target_return_v += ls_qvalues_v
 
     # Q(s, a) <- from collected experience on main net (because of partial SGD)
     critic_net = tgt_net.model.get_critic_net()
@@ -131,7 +133,8 @@ def core_training_loop(
 
     if reward_norm:
         critic_loss_v = \
-            nn.functional.mse_loss(qvalues_v.squeeze(-1) / 16.0, target_return_v / 16.0)
+            nn.functional.mse_loss(qvalues_v.squeeze(-1) / RNORM_SCALE_FACTOR,
+                                   target_return_v / RNORM_SCALE_FACTOR)
     else:
         critic_loss_v = nn.functional.mse_loss(qvalues_v.squeeze(-1), target_return_v)
 
@@ -154,24 +157,28 @@ def core_training_loop(
     # NOTE: You could unfreeze after backward(), but wastes memory and computation
     # We need gradients to flow thru the critic to actions, but it does not need
     # gradients wrt. to critics own weights
-    # for p in critic_params:
-    #     p.requires_grad_(False)
+    for p in critic_params:
+        p.requires_grad_(False)
 
     actor_net = tgt_net.model.get_actor_net()
     current_actions_v = actor_net(states_v)
     # Invert sign and propagate back from Critic
     if reward_norm:
-        actor_loss_v = -critic_net(states_v, current_actions_v).mean() / 16.0
+        actor_loss_v = -critic_net(states_v, current_actions_v).mean() / RNORM_SCALE_FACTOR
     else:
         actor_loss_v = -critic_net(states_v, current_actions_v).mean()
+
+    # NOTE: Add action penalty to limit to smaller torque values and avoid reward hacking
+    actor_loss_v += ACTION_PENALTY_COEF * (current_actions_v ** 2).mean()
+
     actor_loss_v.backward(retain_graph=True)
     torch.nn.utils.clip_grad_norm_(tgt_net.model.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
     actor_scheduler.step()
 
-    # # unfreeze critic
-    # for p in critic_params:
-    #     p.requires_grad_(True)
+    # unfreeze critic
+    for p in critic_params:
+        p.requires_grad_(True)
 
     # Total loss for logging (not used for backprop)
     total_loss_v = critic_loss_v + actor_loss_v
@@ -320,11 +327,10 @@ if __name__ == "__main__":
         )
         training_time = time.time() - iter_start_time
 
-        # TODO - add soft sync
-        #tgt_net.sync()
-
         # Print periodic performance summary every 500 iterations
-        if iter_no % 10000 == 0:
+        if iter_no % 2000 == 0:
+            print("WARNING: RESETTING BUFFER!!")
+            replay_buffer.populate(REPLAY_BUFFER_SIZE)
             perf_tracker.print_checkpoint(int(iter_no), frame_idx)
 
         # Test trials to check success condition

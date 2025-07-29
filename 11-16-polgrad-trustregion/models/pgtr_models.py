@@ -217,6 +217,10 @@ class DDPGActor(nn.Module):
             nn.Linear(hidden2_dim, action_dim)
         )
 
+        # Initialize last actor layer w/ smaller stddev (DDPG paper trick)
+        nn.init.uniform_(self.network[-1].weight, -3e-3, 3e-3)
+        nn.init.uniform_(self.network[-1].bias, -3e-3, 3e-3)
+
     def forward(self, x: torch.Tensor):
         # tanh scaling to action bounds [-2, 2] for Pendulum
         actions_mu = torch.tanh(self.network(x)) * self.action_scale
@@ -254,7 +258,6 @@ class DDPG(nn.Module):
         self.action_dim = action_dim
         self.critic = DDPGCritic(state_dim, action_dim, critic_hidden1_dim, critic_hidden2_dim)
         self.actor = DDPGActor(state_dim, action_dim, actor_hidden1_dim, actor_hidden2_dim)
-
 
     def forward(self, x: torch.Tensor):
         actions_mean = self.actor(x)

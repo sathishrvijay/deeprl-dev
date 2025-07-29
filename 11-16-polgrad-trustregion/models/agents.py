@@ -58,11 +58,12 @@ class AgentDDPG(ptan.agent.BaseAgent):
                 agent_states = [np.zeros(action.shape, np.float32) for action in actions]
             # Implement OU noise
             new_agent_states = []
-            for a_state, action in zip(agent_states, actions):
+            for idx, (a_state, action) in enumerate(zip(agent_states, actions)):
                 a_state += self.ou_theta * (self.ou_mu - a_state)
                 a_state += self.ou_sigma * np.random.normal(size=action.shape)
                 action += self.ou_eps * a_state
                 # stay w/in -2.0 to 2.0 for pendulum after OU noise added
-                action = np.clip(action, -2.0, 2.0)
+                actions[idx] = np.clip(action, -2.0, 2.0)
                 new_agent_states.append(a_state.copy())
+
         return actions, new_agent_states
