@@ -13,10 +13,6 @@ from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
 """This is the implementation of DDPG with Pendulum-v1 RL using the PTAN wrapper libraries.
-TODOs 07/22/25:
-- OU noise implementation for exploration in DDPG model
-- soft target network parameters update
-- update the loss function in core_training_loop()
 """
 
 # HPARAMS
