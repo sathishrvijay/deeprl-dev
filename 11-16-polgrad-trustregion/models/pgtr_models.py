@@ -214,12 +214,6 @@ class SAC(nn.Module):
         self.actor = ContinuousA2CActor(state_dim, action_dim, actor_hidden1_dim,
                                         actor_hidden2_dim)
 
-    def forward(self, x: torch.Tensor):
-        qvalue_1 = self.critic_1(x)
-        qvalue_2 = self.critic_2(x)
-        actions_mean, actions_logvar = self.actor(x)
-        return actions_mean, actions_logvar, qvalue_1, qvalue_2
-
     def get_action_distribution(self, x: torch.Tensor):
         actions_mean, actions_logvar = self.actor(x)
         return actions_mean, actions_logvar
@@ -236,6 +230,12 @@ class SAC(nn.Module):
                 std = torch.exp(actions_logvar / 2)
                 eps = torch.randn_like(std)
                 return actions_mean + std * eps
+
+    def forward(self, x: torch.Tensor):
+        actions = self.sample_action(x, deterministic=False)
+        qvalue_1 = self.critic_1(x, actions)
+        qvalue_2 = self.critic_2(x, actions)
+        return actions, qvalue_1, qvalue_2
 
     def get_actor_parameters(self):
         return self.actor.parameters()

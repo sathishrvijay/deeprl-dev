@@ -53,6 +53,7 @@ CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # Pendulum success threshold
 RNORM_SCALE_FACTOR = 5.0  # reward normalization scale factor
+SAC_ENTROPYTEMP_COEF = 0.1  # depends on action space dim, set lower if dim increases
 # ACTION_PENALTY_COEF = 0.01   #prevents actor from going to max torque
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
@@ -101,9 +102,9 @@ def unpack_batch_ddqn(batch: tt.List[ptan.experience.ExperienceFirstLast]):
     return states_v, actions_v, rewards_v, last_states_v, done_masks_v
 
 
-def critic_training_pass(tgt_net, optimizers, schedulers,
-    states_v, actions_v, target_return_v,
-    reward_norm, critic_id: int):
+def critic_training_pass(tgt_net, critic_id: int, optimizers, schedulers,
+    states_v, actions_v, target_return_v
+    ):
     """TODO: Add entropy bonus term"""
     assert critic_id in [1, 2]
     critic_net = tgt_net.model.get_critic_net(critic_id)
@@ -111,13 +112,10 @@ def critic_training_pass(tgt_net, optimizers, schedulers,
     optimizer.zero_grad()
 
     qvalues_v = critic_net(states_v, actions_v)
-
-    if reward_norm:
-        critic_loss_v = \
-            nn.functional.mse_loss(qvalues_v.squeeze(-1) / RNORM_SCALE_FACTOR,
-                                   target_return_v / RNORM_SCALE_FACTOR)
-    else:
-        critic_loss_v = nn.functional.mse_loss(qvalues_v.squeeze(-1), target_return_v)
+    # Note: Entropy Bonus term in return target also scales same as original target
+    critic_loss_v = \
+        nn.functional.mse_loss(qvalues_v.squeeze(-1) / RNORM_SCALE_FACTOR,
+                                target_return_v / RNORM_SCALE_FACTOR)
 
     # Safety check for NaN/Inf values
     if torch.isnan(critic_loss_v) or torch.isinf(critic_loss_v):
@@ -132,6 +130,8 @@ def critic_training_pass(tgt_net, optimizers, schedulers,
     torch.nn.utils.clip_grad_norm_(critic_params, CLIP_GRAD)
     optimizer.step()
     scheduler.step()
+
+    return critic_loss_v
 
 
 def core_training_loop(
@@ -149,31 +149,31 @@ def core_training_loop(
     """DDPG/SAC samples mini-batches from Replay Buffer because it is Off Policy PG
     Returns: Dictionary containing loss components for tracking
     """
-    for opt in [actor_optimizer, critic1_optimizer, critic2_optimizer]:
-        opt.zero_grad()
-
     batch = replay_buffer.sample(BATCH_SIZE)
     states_v, actions_v, target_return_v, last_states_v, done_masks_v = \
         unpack_batch_ddqn(batch)
 
     # Note: Separate loss computation and backpropagation for Critic and Actor
-    # Critic loss: MSE(r + gamma * QT(s', muT(s)) - Q(s, a)); T <- Target net
+    # Critic loss TODO: MSE(r + gamma * QT(s', muT(s)) - Q(s, a)); T <- Target net
     # s' <- from collected experience
     # TODO: move this piece into critic training pass as well
     target_net = tgt_net.target_model
     with torch.no_grad():
-        _, _, ls_qv1_v, ls_qv2_v = target_net(last_states_v)
+        _, ls_qv1_v, ls_qv2_v = target_net(last_states_v)
         ls_qv1_v = (GAMMA ** N_TD_STEPS) * ls_qv1_v.squeeze(1).data
         ls_qv2_v = (GAMMA ** N_TD_STEPS) * ls_qv2_v.squeeze(1).data
         # zero out if s' is a terminal state
         ls_qv1_v[done_masks_v], ls_qv2_v[done_masks_v] = 0.0, 0.0
         target_return_v += torch.min(ls_qv1_v, ls_qv2_v)
+        # Add Entropy bonus to Target
+        target_return_v -= SAC_ENTROPYTEMP_COEF * torch.log(actions_v)
 
     # Q(s, a) <- from collected experience on main net (because of partial SGD)
+    critic_loss_v = torch.tensor(0.0, dtype=torch.float32)
     for critic_id in [1, 2]:
-        critic_training_pass(tgt_net, critic_optimizers, critic_schedulers,
-            states_v, actions_v, target_return_v,
-            reward_norm, critic_id)
+        critic_loss_v += critic_training_pass(tgt_net, critic_id,
+            critic_optimizers, critic_schedulers,
+            states_v, actions_v, target_return_v)
 
 
     # Actor loss:
@@ -182,26 +182,28 @@ def core_training_loop(
     # Note: We need gradients to flow thru the critic to actions, but it does not need
     # gradients wrt. to critics own weights
     # In SAC, w/ 2 critics, by default first critic is used
+    actor_optimizer.zero_grad()
+    critic_params = tgt_net.model.get_critic_parameters(critic_id=1)
     for p in critic_params:
         p.requires_grad_(False)
 
     # Sample action from Actor w/ reparametrization trick for differentiability
-    actor_net = tgt_net.model.get_actor_net()
-    actions_mu_v, actions_logvar_v = actor_net(states_v)
-    std_v = torch.exp(actions_logvar_v / 2)
-    eps_v = torch.randn_like(std_v)
-    current_actions_v = actions_mu_v + std_v * eps_v
-    # Invert sign and propagate back from Critic
-    if reward_norm:
-        actor_loss_v = -critic1_net(states_v, current_actions_v).mean() / RNORM_SCALE_FACTOR
-    else:
-        actor_loss_v = -critic1_net(states_v, current_actions_v).mean()
+
+    critic_net = tgt_net.model.get_critic_net(critic_id=1)
+    # actor_net = tgt_net.model.get_actor_net()
+    # actions_mu_v, actions_logvar_v = actor_net(states_v)
+    # std_v = torch.exp(actions_logvar_v / 2)
+    # eps_v = torch.randn_like(std_v)
+    # current_actions_v = actions_mu_v + std_v * eps_v
+
+    # Invert sign to gradient ascend
+    # current_actions_v = tgt_net.model.sample_action(states_v, deterministic=False)
+    # actor_loss_v = -critic_net(states_v, current_actions_v).mean()
+    actions_v, qvalues1_v, _ = tgt_net.model(states_v)
+    actor_loss_v = -(qvalues1_v - SAC_ENTROPYTEMP_COEF * torch.log(actions_v)) / RNORM_SCALE_FACTOR
 
     # NOTE: Add action penalty to limit to smaller torque values and avoid reward hacking
     # actor_loss_v += ACTION_PENALTY_COEF * (current_actions_v ** 2).mean()
-
-    # TODO - Add Entropy bonus
-
 
     actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(tgt_net.model.get_actor_parameters(), CLIP_GRAD)
@@ -221,13 +223,13 @@ def core_training_loop(
     # wT = (1 - tau) *wT + tau *w
     tgt_net.alpha_sync(alpha=0.995)
 
-    # Debug - check policy statistics and loss values
-    if debug and iter_no % 100 == 0:
-        with torch.no_grad():
-            current_actions_v = current_actions_v.mean(dim=0).cpu().numpy()
-            print(f"Action μ={current_actions_v[0]:.3f}, "
-                  f"Q-val range=[{qvalues_v.min():.2f}, {qvalues_v.max():.2f}], "
-                  f"Target range=[{target_return_v.min():.2f}, {target_return_v.max():.2f}]")
+    # # Debug - check policy statistics and loss values
+    # if debug and iter_no % 100 == 0:
+    #     with torch.no_grad():
+    #         current_actions_v = current_actions_v.mean(dim=0).cpu().numpy()
+    #         print(f"Action μ={current_actions_v[0]:.3f}, "
+    #               f"Q-val range=[{qvalues_v.min():.2f}, {qvalues_v.max():.2f}], "
+    #               f"Target range=[{target_return_v.min():.2f}, {target_return_v.max():.2f}]")
 
     # Return loss components for tracking
     return {
@@ -360,8 +362,8 @@ if __name__ == "__main__":
         # Training step with separate optimizers
         loss_dict = core_training_loop(
             tgt_net, replay_buffer,
-            actor_optimizer, critic1_optimizer, critic2_optimizer,
-            actor_scheduler, critic1_scheduler, critic2_scheduler,
+            actor_optimizer, [critic1_optimizer, critic2_optimizer],
+            actor_scheduler, [critic1_scheduler, critic2_scheduler],
             frame_idx, iter_no
         )
         training_time = time.time() - iter_start_time
