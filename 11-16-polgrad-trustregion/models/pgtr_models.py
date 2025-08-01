@@ -179,7 +179,8 @@ class ContinuousA2C(nn.Module):
         return actions_mean, actions_logvar
 
     def sample_action(self, state: torch.Tensor, deterministic: bool = False):
-        """Sample action from the policy. Used for evaluation and action selection."""
+        """Sample action from the policy using the Reparametrizion trick for differentiability
+        Used for evaluation and action selection."""
         with torch.no_grad():
             actions_mean, actions_logvar = self.get_action_distribution(state)
 
@@ -195,6 +196,56 @@ class ContinuousA2C(nn.Module):
 
     def get_critic_parameters(self):
         return self.critic.parameters()
+
+
+class SAC(nn.Module):
+    """Wrapper class for separate Actor and Critic networks to maintain PTAN compatibility.
+        Note: Bascically identical to ContinuousA2C structure with 2 critic nets.
+        - Actor net is same as A2C
+        - Critic net is same as DDPG
+        """
+    def __init__(self, state_dim: int, action_dim: int,
+                 critic_hidden1_dim: int = 128, critic_hidden2_dim: int = 32,
+                 actor_hidden1_dim: int = 128, actor_hidden2_dim: int = 64):
+        super(SAC, self).__init__()
+        self.action_dim = action_dim
+        self.critic_1 = DDPGCritic(state_dim, action_dim, critic_hidden1_dim, critic_hidden2_dim)
+        self.critic_2 = DDPGCritic(state_dim, action_dim, critic_hidden1_dim, critic_hidden2_dim)
+        self.actor = ContinuousA2CActor(state_dim, action_dim, actor_hidden1_dim,
+                                        actor_hidden2_dim)
+
+    def forward(self, x: torch.Tensor):
+        qvalue_1 = self.critic_1(x)
+        qvalue_2 = self.critic_2(x)
+        actions_mean, actions_logvar = self.actor(x)
+        return actions_mean, actions_logvar, qvalue_1, qvalue_2
+
+    def get_action_distribution(self, x: torch.Tensor):
+        actions_mean, actions_logvar = self.actor(x)
+        return actions_mean, actions_logvar
+
+    def sample_action(self, state: torch.Tensor, deterministic: bool = False):
+        """Sample action from the policy using the Reparametrizion trick for differentiability
+        Used for evaluation and action selection."""
+        with torch.no_grad():
+            actions_mean, actions_logvar = self.get_action_distribution(state)
+
+            if deterministic:
+                return actions_mean
+            else:
+                std = torch.exp(actions_logvar / 2)
+                eps = torch.randn_like(std)
+                return actions_mean + std * eps
+
+    def get_actor_parameters(self):
+        return self.actor.parameters()
+
+    def get_critic_parameters(self, critic_id: int = 1):
+        if critic_id == 1:
+            return self.critic_1.parameters()
+        else:
+            assert(critic_id == 2)
+            return self.critic_2.parameters()
 
 
 class DDPGActor(nn.Module):
