@@ -12,7 +12,19 @@ from functools import partial
 from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
-"""This is the implementation of DDPG with Pendulum-v1 RL using the PTAN wrapper libraries.
+"""This is the implementation of SAC with Pendulum-v1 RL using the PTAN wrapper libraries.
+Can reuse a lot of existing modules:
+- reparametrization trick: for sampling actions for experience and training (used in CA A2C)
+- Critc net: can reuse DDPG critic; GPT recommends 2 separate critic nets w/ shared backbone
+- Critic schedulers and optimizers: Separate per critic net due to above
+- Actor net: can reuse A2C actor (outputs mu and logvar for actions)
+- Target nets: only critics use target net
+- SAC model: Basically same as A2C model, but needs 2 critics instead of 1; already has the
+reparametrization trick implemented
+- SAC agent: can reuse the A2C agent since OU noise is not required
+- unpack_batch: can use same as DPPG since it uses Q-values
+- loss func changes (straightforward changes from DDPG)
+- N_TD_STEPS: Since SAC is expected SARSA, rollout is fine for experience collection
 """
 
 # HPARAMS
@@ -34,14 +46,14 @@ CRITIC_LR_START = 1e-3
 CRITIC_LR_END = 1e-4
 ACTOR_LR_START = 3e-5
 ACTOR_LR_END = 1e-5
-LR_DECAY_FRAMES = 5e7
+LR_DECAY_FRAMES = int(5e7)
 
 # PG related - adjusted for continuous actions
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # Pendulum success threshold
 RNORM_SCALE_FACTOR = 5.0  # reward normalization scale factor
-ACTION_PENALTY_COEF = 0.01   #prevents actor from going to max torque
+# ACTION_PENALTY_COEF = 0.01   #prevents actor from going to max torque
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
 # Replay buffer related
@@ -52,13 +64,12 @@ BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 
 def unpack_batch_ddqn(batch: tt.List[ptan.experience.ExperienceFirstLast]):
     """
-    Note: unpacking batch is different for DDQN because Q(s', a') and therefore
+    Note: unpacking batch is different for DDQN/SAC because Q(s', a') and therefore
     target return is only available online during training
     Note: Since, in general, an experience sub-trajectory can be n-steps,
     the terminology used here is last state instead of next state.
     Additionally, reward is equal to the cumulative discounted rewards from
     intermediate steps. All of this is subsumed within ptan.experience.ExperienceFirstLast
-    Note: DDPG only emits the mean action vector unlike other CA A2C algorithms
     """
     states = []
     actions = []
@@ -85,46 +96,20 @@ def unpack_batch_ddqn(batch: tt.List[ptan.experience.ExperienceFirstLast]):
     last_states_v = torch.tensor(np.stack(last_states), dtype=torch.float32)
     done_masks_v = torch.tensor(done_masks, dtype=torch.bool)
 
-    # Note: for DDPG, Q(s', a') cannot be computed before a' is known from Actor
-    # Hence we return the partial return (aka rewards_v) until this point
+    # Note: for DDPG/SAC, Q(s', a') cannot be computed before a' is known from Actor
+    # Hence we return the partial return (aka rewards_v) at this point
     return states_v, actions_v, rewards_v, last_states_v, done_masks_v
 
 
-def core_training_loop(
-    tgt_net: ptan.agent.TargetNet,
-    replay_buffer: ptan.experience.ExperienceReplayBuffer,
-    actor_optimizer,
-    critic_optimizer,
-    actor_scheduler,
-    critic_scheduler,
-    frame_idx: int,
-    iter_no=None,
-    reward_norm=True,
-    debug=True
-    ):
-    """DDPG samples mini-batches from Replay Buffer because it is Off Policy PG
-    Returns: Dictionary containing loss components for tracking
-    """
-    actor_optimizer.zero_grad()
-    critic_optimizer.zero_grad()
+def critic_training_pass(tgt_net, optimizers, schedulers,
+    states_v, actions_v, target_return_v,
+    reward_norm, critic_id: int):
+    """TODO: Add entropy bonus term"""
+    assert critic_id in [1, 2]
+    critic_net = tgt_net.model.get_critic_net(critic_id)
+    optimizer, scheduler = optimizers[critic_id], schedulers[critic_id]
+    optimizer.zero_grad()
 
-    batch = replay_buffer.sample(BATCH_SIZE)
-    states_v, actions_v, target_return_v, last_states_v, done_masks_v = \
-        unpack_batch_ddqn(batch)
-
-    # Note: Separate loss computation and backpropagation for Critic and Actor
-    # Critic loss: MSE(r + gamma * QT(s', muT(s)) - Q(s, a)); T <- Target net
-    # s' <- from collected experience
-    target_net = tgt_net.target_model
-    with torch.no_grad():
-        ls_qvalues_v = target_net(last_states_v)[1].squeeze(1).data
-        ls_qvalues_v *= GAMMA ** N_TD_STEPS
-        # zero out if s' is a terminal state
-        ls_qvalues_v[done_masks_v] = 0.0
-        target_return_v += ls_qvalues_v
-
-    # Q(s, a) <- from collected experience on main net (because of partial SGD)
-    critic_net = tgt_net.model.get_critic_net()
     qvalues_v = critic_net(states_v, actions_v)
 
     if reward_norm:
@@ -136,36 +121,87 @@ def core_training_loop(
 
     # Safety check for NaN/Inf values
     if torch.isnan(critic_loss_v) or torch.isinf(critic_loss_v):
-        print(f"WARNING: Invalid critic loss detected: {critic_loss_v.item()}")
+        print(f"WARNING: critic_id={critic_id} Invalid critic loss detected: {critic_loss_v.item()}")
         print(f"Q-values: min={qvalues_v.min():.4f}, max={qvalues_v.max():.4f}")
         print(f"Targets: min={target_return_v.min():.4f}, max={target_return_v.max():.4f}")
         return {'total_loss': 0.0, 'critic_loss': 0.0, 'actor_loss': 0.0}
 
     # Critic loss (only affects critic network)
-    critic_params = tgt_net.model.get_critic_parameters()
+    critic_params = tgt_net.model.get_critic_parameters(critic_id)
     critic_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(critic_params, CLIP_GRAD)
-    critic_optimizer.step()
-    critic_scheduler.step()
+    optimizer.step()
+    scheduler.step()
+
+
+def core_training_loop(
+    tgt_net: ptan.agent.TargetNet,
+    replay_buffer: ptan.experience.ExperienceReplayBuffer,
+    actor_optimizer,
+    critic_optimizers,
+    actor_scheduler,
+    critic_schedulers,
+    frame_idx: int,
+    iter_no=None,
+    reward_norm=True,
+    debug=True
+    ):
+    """DDPG/SAC samples mini-batches from Replay Buffer because it is Off Policy PG
+    Returns: Dictionary containing loss components for tracking
+    """
+    for opt in [actor_optimizer, critic1_optimizer, critic2_optimizer]:
+        opt.zero_grad()
+
+    batch = replay_buffer.sample(BATCH_SIZE)
+    states_v, actions_v, target_return_v, last_states_v, done_masks_v = \
+        unpack_batch_ddqn(batch)
+
+    # Note: Separate loss computation and backpropagation for Critic and Actor
+    # Critic loss: MSE(r + gamma * QT(s', muT(s)) - Q(s, a)); T <- Target net
+    # s' <- from collected experience
+    # TODO: move this piece into critic training pass as well
+    target_net = tgt_net.target_model
+    with torch.no_grad():
+        _, _, ls_qv1_v, ls_qv2_v = target_net(last_states_v)
+        ls_qv1_v = (GAMMA ** N_TD_STEPS) * ls_qv1_v.squeeze(1).data
+        ls_qv2_v = (GAMMA ** N_TD_STEPS) * ls_qv2_v.squeeze(1).data
+        # zero out if s' is a terminal state
+        ls_qv1_v[done_masks_v], ls_qv2_v[done_masks_v] = 0.0, 0.0
+        target_return_v += torch.min(ls_qv1_v, ls_qv2_v)
+
+    # Q(s, a) <- from collected experience on main net (because of partial SGD)
+    for critic_id in [1, 2]:
+        critic_training_pass(tgt_net, critic_optimizers, critic_schedulers,
+            states_v, actions_v, target_return_v,
+            reward_norm, critic_id)
+
 
     # Actor loss:
     # Actor's optimizer only updates actor weights, so freezing critic weights is purely
     # for memory and compute efficiency, not functionally required for correctness
     # Note: We need gradients to flow thru the critic to actions, but it does not need
     # gradients wrt. to critics own weights
+    # In SAC, w/ 2 critics, by default first critic is used
     for p in critic_params:
         p.requires_grad_(False)
 
+    # Sample action from Actor w/ reparametrization trick for differentiability
     actor_net = tgt_net.model.get_actor_net()
-    current_actions_v = actor_net(states_v)
+    actions_mu_v, actions_logvar_v = actor_net(states_v)
+    std_v = torch.exp(actions_logvar_v / 2)
+    eps_v = torch.randn_like(std_v)
+    current_actions_v = actions_mu_v + std_v * eps_v
     # Invert sign and propagate back from Critic
     if reward_norm:
-        actor_loss_v = -critic_net(states_v, current_actions_v).mean() / RNORM_SCALE_FACTOR
+        actor_loss_v = -critic1_net(states_v, current_actions_v).mean() / RNORM_SCALE_FACTOR
     else:
-        actor_loss_v = -critic_net(states_v, current_actions_v).mean()
+        actor_loss_v = -critic1_net(states_v, current_actions_v).mean()
 
     # NOTE: Add action penalty to limit to smaller torque values and avoid reward hacking
-    actor_loss_v += ACTION_PENALTY_COEF * (current_actions_v ** 2).mean()
+    # actor_loss_v += ACTION_PENALTY_COEF * (current_actions_v ** 2).mean()
+
+    # TODO - Add Entropy bonus
+
 
     actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(tgt_net.model.get_actor_parameters(), CLIP_GRAD)
@@ -244,41 +280,47 @@ if __name__ == "__main__":
     # setup the agent and target net
     n_states = vector_env.single_observation_space.shape[0]  # Pendulum has Box(3,) observation space
     n_actions = vector_env.single_action_space.shape[0]      # Pendulum has Box(1,) action space
-    net = pgtr_models.DDPG(
+    net = pgtr_models.SAC(
         n_states, n_actions,
         CRITIC_HIDDEN1_DIM, CRITIC_HIDDEN2_DIM,
         ACTOR_HIDDEN1_DIM, ACTOR_HIDDEN2_DIM
     )
+
+    # Note: we don't actually need target net for Actor
     tgt_net = ptan.agent.TargetNet(net)
 
     # Setup the agent, action policy, experience generation and experience buffer
-    agent = agents.AgentDDPG(net)
+    agent = agents.AgentContinuousA2C(net)
     exp_source = ptan.experience.VectorExperienceSourceFirstLast(vector_env, agent, gamma=GAMMA,
         steps_count=N_TD_STEPS)
     replay_buffer = ptan.experience.ExperienceReplayBuffer(exp_source, buffer_size=REPLAY_BUFFER_SIZE)
 
     # don't need a vectorized trial env
     test_env = gym.make(RL_ENV)
-    test_agent = agents.AgentDDPG(net, deterministic=True)
+    test_agent = agents.AgentContinuousA2C(net, deterministic=True)
 
     # Initialize training with performance tracking
     iter_no = 0.0
     trial = 0
     solved = False
-
-    # Separate optimizers for actor and critic
-    # A2C reports more stable results w/ RMSProp for critic, Adam for actor
-    critic_optimizer = optim.RMSprop(net.get_critic_parameters(), lr=CRITIC_LR_START, eps=1e-5, alpha=0.99)
-    actor_optimizer = optim.Adam(net.get_actor_parameters(), lr=ACTOR_LR_START, eps=1e-5)
-
     max_return = -1000.0
 
     # each iteration of exp_source yields N_ENVS experiences
     batch_size = N_ROLLOUT_STEPS * N_ENVS
 
-    # Separate schedulers for actor and critic
-    critic_scheduler = optim.lr_scheduler.LinearLR(
-        critic_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
+    # Separate optimizers & schedulers for actor and critics
+    # A2C reports more stable results w/ RMSProp for critic, Adam for actor
+    critic1_optimizer = optim.RMSprop(net.get_critic_parameters(), lr=CRITIC_LR_START,
+        eps=1e-5, alpha=0.99)
+    critic2_optimizer = optim.RMSprop(net.get_critic_parameters(critic_id=2), lr=CRITIC_LR_START,
+        eps=1e-5, alpha=0.99)
+    actor_optimizer = optim.Adam(net.get_actor_parameters(), lr=ACTOR_LR_START, eps=1e-5)
+
+    critic1_scheduler = optim.lr_scheduler.LinearLR(
+        critic1_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
+        total_iters=LR_DECAY_FRAMES // batch_size)
+    critic2_scheduler = optim.lr_scheduler.LinearLR(
+        critic2_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
         total_iters=LR_DECAY_FRAMES // batch_size)
     actor_scheduler = optim.lr_scheduler.LinearLR(
         actor_optimizer, start_factor=1.0, end_factor=ACTOR_LR_END / ACTOR_LR_START,
@@ -286,7 +328,7 @@ if __name__ == "__main__":
 
     # Initialize performance tracker and print training header
     perf_tracker = PerformanceTracker()
-    network_config = f"Continuous A2C: Critic({CRITIC_HIDDEN1_DIM}-{CRITIC_HIDDEN2_DIM}), Actor({ACTOR_HIDDEN1_DIM}-{ACTOR_HIDDEN2_DIM})"
+    network_config = f"SAC: Critic({CRITIC_HIDDEN1_DIM}-{CRITIC_HIDDEN2_DIM}), Actor({ACTOR_HIDDEN1_DIM}-{ACTOR_HIDDEN2_DIM})"
     hyperparams = {
         'n_envs': N_ENVS,
         'n_td_steps': N_TD_STEPS,
@@ -313,13 +355,14 @@ if __name__ == "__main__":
         iter_start_time = time.time()
         # Collect experiences every iteration
         replay_buffer.populate(BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
-        agent.decay_ou_eps()
         frame_idx += BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP
 
         # Training step with separate optimizers
         loss_dict = core_training_loop(
-            tgt_net, replay_buffer, actor_optimizer, critic_optimizer,
-            actor_scheduler, critic_scheduler, frame_idx, iter_no
+            tgt_net, replay_buffer,
+            actor_optimizer, critic1_optimizer, critic2_optimizer,
+            actor_scheduler, critic1_scheduler, critic2_scheduler,
+            frame_idx, iter_no
         )
         training_time = time.time() - iter_start_time
 
@@ -344,11 +387,12 @@ if __name__ == "__main__":
 
         if iter_no % 100 == 0:
             # Enhanced logging with timing information and separate learning rates
-            critic_lr = critic_optimizer.param_groups[0]["lr"]
+            critic1_lr = critic1_optimizer.param_groups[0]["lr"]
+            critic2_lr = critic2_optimizer.param_groups[0]["lr"]
             actor_lr = actor_optimizer.param_groups[0]["lr"]
             print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
                 f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
-                f"critic_lr={critic_lr:.5e}, actor_lr={actor_lr:.5e}, "
+                f"critic1_lr={critic1_lr:.5e}, critic2_lr={critic2_lr:.5e}, actor_lr={actor_lr:.5e}, "
                 f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
                 f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m | "
                 f"losses: total={loss_dict['total_loss']:.4f}, "
@@ -360,7 +404,8 @@ if __name__ == "__main__":
 
     # Training completed - print comprehensive summary using utility function
     final_summary = perf_tracker.get_summary()
-    critic_lr = critic_optimizer.param_groups[0]["lr"]
+    critic1_lr = critic1_optimizer.param_groups[0]["lr"]
+    # critic2_lr = critic1_optimizer.param_groups[0]["lr"]
     actor_lr = actor_optimizer.param_groups[0]["lr"]
     print_final_summary(
         solved=solved,
@@ -368,7 +413,7 @@ if __name__ == "__main__":
         target_reward=PENDULUM_SOLVED_REWARD,
         final_summary=final_summary,
         frame_idx=frame_idx,
-        current_alpha=(actor_lr, critic_lr),
+        current_alpha=(actor_lr, critic1_lr),
         epsilon=0.0,  # Not using epsilon in this implementation
         iter_no=int(iter_no)
     )
