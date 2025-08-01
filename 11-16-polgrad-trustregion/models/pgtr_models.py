@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 class DiscreteA2CCritic(nn.Module):
     """Separate Critic Network for A2C with discrete actions."""
@@ -229,13 +230,43 @@ class SAC(nn.Module):
             else:
                 std = torch.exp(actions_logvar / 2)
                 eps = torch.randn_like(std)
-                return actions_mean + std * eps
+                actions = actions_mean + std * eps
+                actions = torch.clamp(actions, -2, 2)
+                return actions
+
+    def compute_logproba_actions(self, actions, state: torch.Tensor):
+        """Compute log probabilities for continuous actions
+        Gaussian log probability: -0.5 * (log(2π) + log_var + (x-μ)²/σ²)"""
+        actions_mu, actions_logvar = self.get_action_distribution(state)
+        log_proba = -0.5 * (
+            torch.log(torch.tensor(2 * math.pi)) +
+            actions_logvar +
+            (actions - actions_mu).pow(2) / torch.exp(actions_logvar)
+        )
+        # Sum over action dimensions
+        log_proba = log_proba.sum(dim=-1)
+        return log_proba
+
 
     def forward(self, x: torch.Tensor):
+        # sample actions from action pdfs for critic
         actions = self.sample_action(x, deterministic=False)
         qvalue_1 = self.critic_1(x, actions)
         qvalue_2 = self.critic_2(x, actions)
-        return actions, qvalue_1, qvalue_2
+
+        # compute logproba
+        logproba_actions = self.compute_logproba_actions(actions, x)
+        return logproba_actions, qvalue_1, qvalue_2
+
+    def get_critic_net(self, critic_id: int = 1):
+        if critic_id == 1:
+            return self.critic_1
+        else:
+            assert(critic_id == 2)
+            return self.critic_2
+
+    def get_actor_net(self):
+        return self.actor
 
     def get_actor_parameters(self):
         return self.actor.parameters()

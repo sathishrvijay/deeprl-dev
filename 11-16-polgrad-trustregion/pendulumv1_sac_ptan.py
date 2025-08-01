@@ -108,21 +108,20 @@ def critic_training_pass(tgt_net, critic_id: int, optimizers, schedulers,
     """TODO: Add entropy bonus term"""
     assert critic_id in [1, 2]
     critic_net = tgt_net.model.get_critic_net(critic_id)
-    optimizer, scheduler = optimizers[critic_id], schedulers[critic_id]
+    optimizer, scheduler = optimizers[critic_id-1], schedulers[critic_id-1]
     optimizer.zero_grad()
 
     qvalues_v = critic_net(states_v, actions_v)
     # Note: Entropy Bonus term in return target also scales same as original target
-    critic_loss_v = \
-        nn.functional.mse_loss(qvalues_v.squeeze(-1) / RNORM_SCALE_FACTOR,
-                                target_return_v / RNORM_SCALE_FACTOR)
+    critic_loss_v = nn.functional.mse_loss(qvalues_v.squeeze(-1) / RNORM_SCALE_FACTOR,
+                                           target_return_v / RNORM_SCALE_FACTOR)
 
     # Safety check for NaN/Inf values
     if torch.isnan(critic_loss_v) or torch.isinf(critic_loss_v):
+        # breakpoint()
         print(f"WARNING: critic_id={critic_id} Invalid critic loss detected: {critic_loss_v.item()}")
-        print(f"Q-values: min={qvalues_v.min():.4f}, max={qvalues_v.max():.4f}")
-        print(f"Targets: min={target_return_v.min():.4f}, max={target_return_v.max():.4f}")
-        return {'total_loss': 0.0, 'critic_loss': 0.0, 'actor_loss': 0.0}
+        print(f"Q-values: min={qvalues_v.min().item():.4f}, max={qvalues_v.max().item():.4f}")
+        # print(f"Targets: min={target_return_v.min():.4f}, max={target_return_v.max():.4f}")
 
     # Critic loss (only affects critic network)
     critic_params = tgt_net.model.get_critic_parameters(critic_id)
@@ -159,48 +158,35 @@ def core_training_loop(
     # TODO: move this piece into critic training pass as well
     target_net = tgt_net.target_model
     with torch.no_grad():
-        _, ls_qv1_v, ls_qv2_v = target_net(last_states_v)
+        ls_logproba_actions_v, ls_qv1_v, ls_qv2_v = target_net(last_states_v)
         ls_qv1_v = (GAMMA ** N_TD_STEPS) * ls_qv1_v.squeeze(1).data
         ls_qv2_v = (GAMMA ** N_TD_STEPS) * ls_qv2_v.squeeze(1).data
         # zero out if s' is a terminal state
         ls_qv1_v[done_masks_v], ls_qv2_v[done_masks_v] = 0.0, 0.0
         target_return_v += torch.min(ls_qv1_v, ls_qv2_v)
         # Add Entropy bonus to Target
-        target_return_v -= SAC_ENTROPYTEMP_COEF * torch.log(actions_v)
+        # logproba_actions_v =
+        target_return_v -= SAC_ENTROPYTEMP_COEF * ls_logproba_actions_v.squeeze(-1).data
 
     # Q(s, a) <- from collected experience on main net (because of partial SGD)
-    critic_loss_v = torch.tensor(0.0, dtype=torch.float32)
+    critic_loss_v = torch.tensor(0.0)
     for critic_id in [1, 2]:
         critic_loss_v += critic_training_pass(tgt_net, critic_id,
             critic_optimizers, critic_schedulers,
             states_v, actions_v, target_return_v)
 
-
     # Actor loss:
-    # Actor's optimizer only updates actor weights, so freezing critic weights is purely
-    # for memory and compute efficiency, not functionally required for correctness
-    # Note: We need gradients to flow thru the critic to actions, but it does not need
-    # gradients wrt. to critics own weights
     # In SAC, w/ 2 critics, by default first critic is used
+    # Sample action from Actor w/ reparametrization trick for differentiability
     actor_optimizer.zero_grad()
-    critic_params = tgt_net.model.get_critic_parameters(critic_id=1)
+    critic_params = list(tgt_net.model.get_critic_parameters(critic_id=1))
     for p in critic_params:
         p.requires_grad_(False)
 
-    # Sample action from Actor w/ reparametrization trick for differentiability
-
-    critic_net = tgt_net.model.get_critic_net(critic_id=1)
-    # actor_net = tgt_net.model.get_actor_net()
-    # actions_mu_v, actions_logvar_v = actor_net(states_v)
-    # std_v = torch.exp(actions_logvar_v / 2)
-    # eps_v = torch.randn_like(std_v)
-    # current_actions_v = actions_mu_v + std_v * eps_v
-
-    # Invert sign to gradient ascend
-    # current_actions_v = tgt_net.model.sample_action(states_v, deterministic=False)
-    # actor_loss_v = -critic_net(states_v, current_actions_v).mean()
-    actions_v, qvalues1_v, _ = tgt_net.model(states_v)
-    actor_loss_v = -(qvalues1_v - SAC_ENTROPYTEMP_COEF * torch.log(actions_v)) / RNORM_SCALE_FACTOR
+    logproba_actions_v, qvalues1_v, _ = tgt_net.model(states_v)
+    # Invert sign to gradient ascent
+    actor_loss_v = -(qvalues1_v - SAC_ENTROPYTEMP_COEF * logproba_actions_v) / RNORM_SCALE_FACTOR
+    actor_loss_v = actor_loss_v.squeeze(-1).mean()
 
     # NOTE: Add action penalty to limit to smaller torque values and avoid reward hacking
     # actor_loss_v += ACTION_PENALTY_COEF * (current_actions_v ** 2).mean()
@@ -218,9 +204,9 @@ def core_training_loop(
     total_loss_v = critic_loss_v + actor_loss_v
 
     # Smooth blend target net parameters in continuous action for training stability
-    # ptan uses alpha = 1 - tau
-    # literature calls this param tau; GPT suggests tau <- 0.005
     # wT = (1 - tau) *wT + tau *w
+    # literature calls this param tau; GPT suggests tau <- 0.005
+    # ptan uses alpha = 1 - tau
     tgt_net.alpha_sync(alpha=0.995)
 
     # # Debug - check policy statistics and loss values
@@ -351,7 +337,6 @@ if __name__ == "__main__":
     frame_idx = 0  # Track total frames of experience generated
     # warm start for replay buffer
     replay_buffer.populate(REPLAY_BUFFER_SIZE)
-    # breakpoint()
     while not solved:
         iter_no += 1.0
         iter_start_time = time.time()
