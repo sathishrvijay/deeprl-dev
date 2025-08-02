@@ -65,7 +65,7 @@ BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 def critic_training_pass(tgt_net, critic_id: int, optimizers, schedulers,
     states_v, actions_v, target_return_v
     ):
-    """TODO: Add entropy bonus term"""
+    """Pull out this method because it needs to be repeated for each critic"""
     assert critic_id in [1, 2]
 
     # Q(s, a) <- from collected experience on main net (because of partial SGD)
