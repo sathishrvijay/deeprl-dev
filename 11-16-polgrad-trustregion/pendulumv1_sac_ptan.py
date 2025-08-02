@@ -3,14 +3,13 @@ import ptan
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 import time
 
-import typing as tt
+
 from functools import partial
 
 from models import agents, pgtr_models
-from utils import PerformanceTracker, print_training_header, print_final_summary
+from utils import common_utils, PerformanceTracker, print_training_header, print_final_summary
 
 """This is the implementation of SAC with Pendulum-v1 RL using the PTAN wrapper libraries.
 Can reuse a lot of existing modules:
@@ -63,50 +62,13 @@ REPLAY_BUFFER_SIZE = 5000
 BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 
 
-def unpack_batch_ddqn(batch: tt.List[ptan.experience.ExperienceFirstLast]):
-    """
-    Note: unpacking batch is different for DDQN/SAC because Q(s', a') and therefore
-    target return is only available online during training
-    Note: Since, in general, an experience sub-trajectory can be n-steps,
-    the terminology used here is last state instead of next state.
-    Additionally, reward is equal to the cumulative discounted rewards from
-    intermediate steps. All of this is subsumed within ptan.experience.ExperienceFirstLast
-    """
-    states = []
-    actions = []
-    rewards = []
-    done_masks = []
-    last_states = []
-    for exp in batch:
-        # Each observation sub-trajectory in the replay buffer is a SARS' tuple
-        states.append(exp.state)
-        actions.append(exp.action)
-        rewards.append(exp.reward)
-        # Note: torch cannot deal with None type
-        if exp.last_state is None:
-            last_states.append(exp.state)
-        else:
-            last_states.append(exp.last_state)
-        done_masks.append(exp.last_state is None)
-
-    # Array stacking during conv should work by default, but direct conversion from list of numpy array
-    # to tensor is very slow, hence the np.stack(...)
-    actions_v = torch.tensor(np.stack(actions), dtype=torch.float32)  # Continuous actions are float
-    rewards_v = torch.tensor(rewards, dtype=torch.float32)
-    states_v = torch.tensor(np.stack(states), dtype=torch.float32)
-    last_states_v = torch.tensor(np.stack(last_states), dtype=torch.float32)
-    done_masks_v = torch.tensor(done_masks, dtype=torch.bool)
-
-    # Note: for DDPG/SAC, Q(s', a') cannot be computed before a' is known from Actor
-    # Hence we return the partial return (aka rewards_v) at this point
-    return states_v, actions_v, rewards_v, last_states_v, done_masks_v
-
-
 def critic_training_pass(tgt_net, critic_id: int, optimizers, schedulers,
     states_v, actions_v, target_return_v
     ):
     """TODO: Add entropy bonus term"""
     assert critic_id in [1, 2]
+
+    # Q(s, a) <- from collected experience on main net (because of partial SGD)
     critic_net = tgt_net.model.get_critic_net(critic_id)
     optimizer, scheduler = optimizers[critic_id-1], schedulers[critic_id-1]
     optimizer.zero_grad()
@@ -141,7 +103,7 @@ def core_training_loop(
     actor_scheduler,
     critic_schedulers,
     frame_idx: int,
-    iter_no=None,
+    iter_no=0,
     reward_norm=True,
     debug=True
     ):
@@ -150,25 +112,24 @@ def core_training_loop(
     """
     batch = replay_buffer.sample(BATCH_SIZE)
     states_v, actions_v, target_return_v, last_states_v, done_masks_v = \
-        unpack_batch_ddqn(batch)
+        common_utils.unpack_batch_ddpg_sac(batch)
 
-    # Note: Separate loss computation and backpropagation for Critic and Actor
-    # Critic loss TODO: MSE(r + gamma * QT(s', muT(s)) - Q(s, a)); T <- Target net
-    # s' <- from collected experience
-    # TODO: move this piece into critic training pass as well
+    # Critic loss:
+    # y = r + gamma * minQT(s', Actor(a'|s')) - log pi(a'|s'); T <- Target net
+    # MSE(y - Q(s, Actor(a|s)))
+    # s' <- from collected experience; a' <- from main actor using reparam trick
     target_net = tgt_net.target_model
     with torch.no_grad():
         ls_logproba_actions_v, ls_qv1_v, ls_qv2_v = target_net(last_states_v)
+        # Add discounted last state Q value to partial return from trajectory
         ls_qv1_v = (GAMMA ** N_TD_STEPS) * ls_qv1_v.squeeze(1).data
         ls_qv2_v = (GAMMA ** N_TD_STEPS) * ls_qv2_v.squeeze(1).data
         # zero out if s' is a terminal state
         ls_qv1_v[done_masks_v], ls_qv2_v[done_masks_v] = 0.0, 0.0
         target_return_v += torch.min(ls_qv1_v, ls_qv2_v)
         # Add Entropy bonus to Target
-        # logproba_actions_v =
         target_return_v -= SAC_ENTROPYTEMP_COEF * ls_logproba_actions_v.squeeze(-1).data
 
-    # Q(s, a) <- from collected experience on main net (because of partial SGD)
     critic_loss_v = torch.tensor(0.0)
     for critic_id in [1, 2]:
         critic_loss_v += critic_training_pass(tgt_net, critic_id,
@@ -176,7 +137,7 @@ def core_training_loop(
             states_v, actions_v, target_return_v)
 
     # Actor loss:
-    # In SAC, w/ 2 critics, by default first critic is used
+    # In SAC, w/ 2 critics, first critic is used for actor loss
     # Sample action from Actor w/ reparametrization trick for differentiability
     actor_optimizer.zero_grad()
     critic_params = list(tgt_net.model.get_critic_parameters(critic_id=1))
@@ -209,13 +170,16 @@ def core_training_loop(
     # ptan uses alpha = 1 - tau
     tgt_net.alpha_sync(alpha=0.995)
 
-    # # Debug - check policy statistics and loss values
-    # if debug and iter_no % 100 == 0:
-    #     with torch.no_grad():
-    #         current_actions_v = current_actions_v.mean(dim=0).cpu().numpy()
-    #         print(f"Action μ={current_actions_v[0]:.3f}, "
-    #               f"Q-val range=[{qvalues_v.min():.2f}, {qvalues_v.max():.2f}], "
-    #               f"Target range=[{target_return_v.min():.2f}, {target_return_v.max():.2f}]")
+    # Debug - check policy Q-values
+    if debug and iter_no % 100 == 0:
+        with torch.no_grad():
+            actions_v = tgt_net.model.sample_action(states_v)
+            actions_v = actions_v.mean(dim=0).cpu().numpy()
+            _, qvalues1_v, qvalues2_v = tgt_net.model(states_v)
+            print(f"Action μ={actions_v[0]:.3f}, "
+                  f"Q1-val range=[{qvalues1_v.min():.2f}, {qvalues1_v.max():.2f}], "
+                  f"Q2-val range=[{qvalues2_v.min():.2f}, {qvalues2_v.max():.2f}], "
+                  f"Target range=[{target_return_v.min():.2f}, {target_return_v.max():.2f}]")
 
     # Return loss components for tracking
     return {
