@@ -10,7 +10,7 @@ import typing as tt
 from functools import partial
 
 from models import agents, pgtr_models
-from utils import PerformanceTracker, print_training_header, print_final_summary
+from utils import common_utils, PerformanceTracker, print_training_header, print_final_summary
 
 """This is the implementation of DDPG with Pendulum-v1 RL using the PTAN wrapper libraries.
 """
@@ -50,46 +50,6 @@ REPLAY_BUFFER_SIZE = 5000
 BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
 
 
-def unpack_batch_ddqn(batch: tt.List[ptan.experience.ExperienceFirstLast]):
-    """
-    Note: unpacking batch is different for DDQN because Q(s', a') and therefore
-    target return is only available online during training
-    Note: Since, in general, an experience sub-trajectory can be n-steps,
-    the terminology used here is last state instead of next state.
-    Additionally, reward is equal to the cumulative discounted rewards from
-    intermediate steps. All of this is subsumed within ptan.experience.ExperienceFirstLast
-    Note: DDPG only emits the mean action vector unlike other CA A2C algorithms
-    """
-    states = []
-    actions = []
-    rewards = []
-    done_masks = []
-    last_states = []
-    for exp in batch:
-        # Each observation sub-trajectory in the replay buffer is a SARS' tuple
-        states.append(exp.state)
-        actions.append(exp.action)
-        rewards.append(exp.reward)
-        # Note: torch cannot deal with None type
-        if exp.last_state is None:
-            last_states.append(exp.state)
-        else:
-            last_states.append(exp.last_state)
-        done_masks.append(exp.last_state is None)
-
-    # Array stacking during conv should work by default, but direct conversion from list of numpy array
-    # to tensor is very slow, hence the np.stack(...)
-    actions_v = torch.tensor(np.stack(actions), dtype=torch.float32)  # Continuous actions are float
-    rewards_v = torch.tensor(rewards, dtype=torch.float32)
-    states_v = torch.tensor(np.stack(states), dtype=torch.float32)
-    last_states_v = torch.tensor(np.stack(last_states), dtype=torch.float32)
-    done_masks_v = torch.tensor(done_masks, dtype=torch.bool)
-
-    # Note: for DDPG, Q(s', a') cannot be computed before a' is known from Actor
-    # Hence we return the partial return (aka rewards_v) until this point
-    return states_v, actions_v, rewards_v, last_states_v, done_masks_v
-
-
 def core_training_loop(
     tgt_net: ptan.agent.TargetNet,
     replay_buffer: ptan.experience.ExperienceReplayBuffer,
@@ -110,7 +70,7 @@ def core_training_loop(
 
     batch = replay_buffer.sample(BATCH_SIZE)
     states_v, actions_v, target_return_v, last_states_v, done_masks_v = \
-        unpack_batch_ddqn(batch)
+        common_utils.unpack_batch_ddpg_sac(batch)
 
     # Note: Separate loss computation and backpropagation for Critic and Actor
     # Critic loss: MSE(r + gamma * QT(s', muT(s)) - Q(s, a)); T <- Target net
@@ -286,7 +246,7 @@ if __name__ == "__main__":
 
     # Initialize performance tracker and print training header
     perf_tracker = PerformanceTracker()
-    network_config = f"Continuous A2C: Critic({CRITIC_HIDDEN1_DIM}-{CRITIC_HIDDEN2_DIM}), Actor({ACTOR_HIDDEN1_DIM}-{ACTOR_HIDDEN2_DIM})"
+    network_config = f"DDPG: Critic({CRITIC_HIDDEN1_DIM}-{CRITIC_HIDDEN2_DIM}), Actor({ACTOR_HIDDEN1_DIM}-{ACTOR_HIDDEN2_DIM})"
     hyperparams = {
         'n_envs': N_ENVS,
         'n_td_steps': N_TD_STEPS,
