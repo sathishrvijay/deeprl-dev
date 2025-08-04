@@ -247,7 +247,6 @@ class SAC(nn.Module):
         log_proba = log_proba.sum(dim=-1)
         return log_proba
 
-
     def forward(self, x: torch.Tensor):
         # sample actions from action pdfs for critic
         actions = self.sample_action(x, deterministic=False)

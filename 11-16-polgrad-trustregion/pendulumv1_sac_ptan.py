@@ -1,6 +1,7 @@
 import gymnasium as gym
 import ptan
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 import time
@@ -52,8 +53,10 @@ CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # Pendulum success threshold
 RNORM_SCALE_FACTOR = 5.0  # reward normalization scale factor
-SAC_ENTROPYTEMP_COEF = 0.1  # depends on action space dim, set lower if dim increases
-# ACTION_PENALTY_COEF = 0.01   #prevents actor from going to max torque
+# Automatic entropy temperature tuning
+LOG_ALPHA_START = 0.0  # Set a starting value for log_alpha
+TARGET_ENTROPY = -1.0  # -action_dim is typical; n_actions is 1 for Pendulum
+ACTION_PENALTY_COEF = 0.01  # Prevents actor from going to max torque
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
 # Replay buffer related
@@ -102,6 +105,9 @@ def core_training_loop(
     critic_optimizers,
     actor_scheduler,
     critic_schedulers,
+    alpha_optimizer,
+    target_entropy,
+    log_alpha,
     frame_idx: int,
     iter_no=0,
     reward_norm=True,
@@ -114,6 +120,8 @@ def core_training_loop(
     states_v, actions_v, target_return_v, last_states_v, done_masks_v = \
         common_utils.unpack_batch_ddpg_sac(batch)
 
+    entropy_alpha = log_alpha.exp().detach()
+
     # Critic loss:
     # y = r + gamma * minQT(s', Actor(a'|s')) - log pi(a'|s'); T <- Target net
     # MSE(y - Q(s, Actor(a|s)))
@@ -124,11 +132,10 @@ def core_training_loop(
         # Add discounted last state Q value to partial return from trajectory
         ls_qv1_v = (GAMMA ** N_TD_STEPS) * ls_qv1_v.squeeze(1).data
         ls_qv2_v = (GAMMA ** N_TD_STEPS) * ls_qv2_v.squeeze(1).data
-        # zero out if s' is a terminal state
         ls_qv1_v[done_masks_v], ls_qv2_v[done_masks_v] = 0.0, 0.0
         target_return_v += torch.min(ls_qv1_v, ls_qv2_v)
-        # Add Entropy bonus to Target
-        target_return_v -= SAC_ENTROPYTEMP_COEF * ls_logproba_actions_v.squeeze(-1).data
+        # Use adaptive alpha
+        target_return_v -= entropy_alpha * ls_logproba_actions_v.squeeze(-1).data
 
     critic_loss_v = torch.tensor(0.0)
     for critic_id in [1, 2]:
@@ -145,23 +152,29 @@ def core_training_loop(
         p.requires_grad_(False)
 
     logproba_actions_v, qvalues1_v, _ = tgt_net.model(states_v)
-    # Invert sign to gradient ascent
-    actor_loss_v = -(qvalues1_v - SAC_ENTROPYTEMP_COEF * logproba_actions_v) / RNORM_SCALE_FACTOR
-    actor_loss_v = actor_loss_v.squeeze(-1).mean()
-
-    # NOTE: Add action penalty to limit to smaller torque values and avoid reward hacking
-    # actor_loss_v += ACTION_PENALTY_COEF * (current_actions_v ** 2).mean()
+    # Current actions for action penalty
+    mean_actions, _ = tgt_net.model.actor(states_v)
+    action_penalty = ACTION_PENALTY_COEF * (mean_actions ** 2).mean()
+    actor_loss_v = -((qvalues1_v -
+        entropy_alpha * logproba_actions_v) / RNORM_SCALE_FACTOR).squeeze(-1).mean()
+    actor_loss_v = actor_loss_v + action_penalty
 
     actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(tgt_net.model.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
     actor_scheduler.step()
 
+    # Automatic entropy tuning
+    alpha_optimizer.zero_grad()
+    entropy_loss = -(log_alpha * (logproba_actions_v.detach() + target_entropy)).mean()
+    entropy_loss.backward()
+    alpha_optimizer.step()
+
     # unfreeze critic
     for p in critic_params:
         p.requires_grad_(True)
 
-    # Total loss for logging (not used for backprop)
+    # Total loss for logging
     total_loss_v = critic_loss_v + actor_loss_v
 
     # Smooth blend target net parameters in continuous action for training stability
@@ -170,22 +183,23 @@ def core_training_loop(
     # ptan uses alpha = 1 - tau
     tgt_net.alpha_sync(alpha=0.995)
 
-    # Debug - check policy Q-values
     if debug and iter_no % 100 == 0:
         with torch.no_grad():
-            actions_v = tgt_net.model.sample_action(states_v)
-            actions_v = actions_v.mean(dim=0).cpu().numpy()
-            _, qvalues1_v, qvalues2_v = tgt_net.model(states_v)
-            print(f"Action μ={actions_v[0]:.3f}, "
-                  f"Q1-val range=[{qvalues1_v.min():.2f}, {qvalues1_v.max():.2f}], "
-                  f"Q2-val range=[{qvalues2_v.min():.2f}, {qvalues2_v.max():.2f}], "
-                  f"Target range=[{target_return_v.min():.2f}, {target_return_v.max():.2f}]")
+            actions_dbg = tgt_net.model.sample_action(states_v)
+            actions_dbg = actions_dbg.mean(dim=0).cpu().numpy()
+            _, qvalues1_dbg, qvalues2_dbg = tgt_net.model(states_v)
+            print(f"Action μ={actions_dbg[0]:.3f}, "
+                  f"Q1-val range=[{qvalues1_dbg.min():.2f}, {qvalues1_dbg.max():.2f}], "
+                  f"Q2-val range=[{qvalues2_dbg.min():.2f}, {qvalues2_dbg.max():.2f}], "
+                  f"Target range=[{target_return_v.min():.2f}, {target_return_v.max():.2f}], "
+                  f"alpha={entropy_alpha.item():.4f}")
 
-    # Return loss components for tracking
     return {
         'total_loss': total_loss_v.item(),
         'critic_loss': critic_loss_v.item(),
         'actor_loss': actor_loss_v.item(),
+        'entropy_loss': entropy_loss.item(),
+        'entropy_alpha': entropy_alpha.item(),
     }
 
 
@@ -267,6 +281,10 @@ if __name__ == "__main__":
     critic2_optimizer = optim.RMSprop(net.get_critic_parameters(critic_id=2), lr=CRITIC_LR_START,
         eps=1e-5, alpha=0.99)
     actor_optimizer = optim.Adam(net.get_actor_parameters(), lr=ACTOR_LR_START, eps=1e-5)
+    # SAC uses a learnable entropy temperature that tunes explore-exploit dynamically
+    # Set up learnable log_alpha and optimizer for entropy tuning
+    log_alpha = torch.tensor(LOG_ALPHA_START, requires_grad=True)
+    alpha_optimizer = optim.Adam([log_alpha], lr=3e-4)
 
     critic1_scheduler = optim.lr_scheduler.LinearLR(
         critic1_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
@@ -301,6 +319,8 @@ if __name__ == "__main__":
     frame_idx = 0  # Track total frames of experience generated
     # warm start for replay buffer
     replay_buffer.populate(REPLAY_BUFFER_SIZE)
+
+
     while not solved:
         iter_no += 1.0
         iter_start_time = time.time()
@@ -313,7 +333,9 @@ if __name__ == "__main__":
             tgt_net, replay_buffer,
             actor_optimizer, [critic1_optimizer, critic2_optimizer],
             actor_scheduler, [critic1_scheduler, critic2_scheduler],
-            frame_idx, iter_no
+            alpha_optimizer, TARGET_ENTROPY, log_alpha,
+            frame_idx,
+            iter_no
         )
         training_time = time.time() - iter_start_time
 
@@ -349,6 +371,8 @@ if __name__ == "__main__":
                 f"losses: total={loss_dict['total_loss']:.4f}, "
                 f"critic={loss_dict['critic_loss']:.4f}, "
                 f"actor={loss_dict['actor_loss']:.4f}, "
+                f"entropy={loss_dict['entropy_loss']:.5f}, "
+                f"entropy_alpha={loss_dict['entropy_alpha']:.5f}"
             )
 
         solved = average_return > PENDULUM_SOLVED_REWARD  # Pendulum is solved when avg reward > -200
