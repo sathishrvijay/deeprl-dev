@@ -166,7 +166,7 @@ def core_training_loop(
 
     # Automatic entropy tuning
     alpha_optimizer.zero_grad()
-    entropy_loss = -(log_alpha * (logproba_actions_v.detach() + target_entropy)).mean()
+    entropy_loss = -(log_alpha.exp() * (logproba_actions_v.detach() + target_entropy)).mean()
     entropy_loss.backward()
     alpha_optimizer.step()
 
@@ -275,11 +275,9 @@ if __name__ == "__main__":
     batch_size = N_ROLLOUT_STEPS * N_ENVS
 
     # Separate optimizers & schedulers for actor and critics
-    # A2C reports more stable results w/ RMSProp for critic, Adam for actor
-    critic1_optimizer = optim.RMSprop(net.get_critic_parameters(), lr=CRITIC_LR_START,
-        eps=1e-5, alpha=0.99)
-    critic2_optimizer = optim.RMSprop(net.get_critic_parameters(critic_id=2), lr=CRITIC_LR_START,
-        eps=1e-5, alpha=0.99)
+    # SAC paper uses Adam for all optimizers
+    critic1_optimizer = optim.Adam(net.get_critic_parameters(), lr=CRITIC_LR_START, eps=1e-5)
+    critic2_optimizer = optim.Adam(net.get_critic_parameters(critic_id=2), lr=CRITIC_LR_START, eps=1e-5)
     actor_optimizer = optim.Adam(net.get_actor_parameters(), lr=ACTOR_LR_START, eps=1e-5)
     # SAC uses a learnable entropy temperature that tunes explore-exploit dynamically
     # Set up learnable log_alpha and optimizer for entropy tuning
