@@ -169,9 +169,10 @@ def core_training_loop(
 
     # Automatic entropy tuning
     alpha_optimizer.zero_grad()
-    #  ( −log_prob is the sample entropy)
-    entropy_diff = (-logproba_actions_v.detach() - target_entropy)
-    alpha_loss = (log_alpha * entropy_diff).mean()   # no outer ‘–’
+    #  −logproba_action_v is the sample entropy
+    # Note: entropy_diff +ve drives alpha aka exploration down; -ve will drive it back up
+    entropy_diff = -logproba_actions_v.detach() - target_entropy
+    alpha_loss = (log_alpha.exp() * entropy_diff).mean()   # no outer ‘–’
     alpha_loss.backward()
     alpha_optimizer.step()
 
