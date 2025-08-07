@@ -38,31 +38,33 @@ ACTOR_HIDDEN1_DIM = 128
 ACTOR_HIDDEN2_DIM = 64
 
 N_TD_STEPS = 4 # Number of steps aggregated per experience (n in n-step TD)
-N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
+N_ROLLOUT_STEPS = 8 # formal rollout definition;
 
 GAMMA = 0.99  # Slightly lower for Pendulum's shorter episodes
-# Separate learning rates for actor and critic - reduced for stability
-CRITIC_LR_START = 1e-3
+# Separate learning rates for actor and critic
+# SAC doesn't usually require schedulers, pretty robust w/ static LRs
+CRITIC_LR_START = 3e-4
 CRITIC_LR_END = 1e-4
-ACTOR_LR_START = 3e-5
-ACTOR_LR_END = 1e-5
+ACTOR_LR_START = 3e-4
+ACTOR_LR_END = 1e-4
+ENTROPY_LR = 3e-4
 LR_DECAY_FRAMES = int(5e7)
 
 # PG related - adjusted for continuous actions
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # Pendulum success threshold
-RNORM_SCALE_FACTOR = 5.0  # reward normalization scale factor
+RNORM_SCALE_FACTOR = 1.0  # reward normalization scale factor
 # Automatic entropy temperature tuning
 LOG_ALPHA_START = 0.0  # Set a starting value for log_alpha
-TARGET_ENTROPY = -1.0  # -action_dim is typical; n_actions is 1 for Pendulum
+TARGET_ENTROPY = -2.0  # -action_dim is default but too low in practice; n_actions is 1 for Pendulum
 ACTION_PENALTY_COEF = 0.01  # Prevents actor from going to max torque
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
 # Replay buffer related
-BATCH_SIZE = 32
-REPLAY_BUFFER_SIZE = 5000
-BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = 50
+BATCH_SIZE = 128  # training mini-batch size
+REPLAY_BUFFER_SIZE = 10000
+BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = N_ENVS * N_ROLLOUT_STEPS  # 8 x 8
 
 
 def critic_training_pass(tgt_net, critic_id: int, optimizers, schedulers,
@@ -120,7 +122,8 @@ def core_training_loop(
     states_v, actions_v, target_return_v, last_states_v, done_masks_v = \
         common_utils.unpack_batch_ddpg_sac(batch)
 
-    entropy_alpha = log_alpha.exp().detach()
+    # clamp minimum value for alpha
+    entropy_alpha = log_alpha.exp().clamp(min=1e-3).detach()
 
     # Critic loss:
     # y = r + gamma * minQT(s', Actor(a'|s')) - log pi(a'|s'); T <- Target net
@@ -166,8 +169,10 @@ def core_training_loop(
 
     # Automatic entropy tuning
     alpha_optimizer.zero_grad()
-    entropy_loss = -(log_alpha.exp() * (logproba_actions_v.detach() + target_entropy)).mean()
-    entropy_loss.backward()
+    #  ( −log_prob is the sample entropy)
+    entropy_diff = (-logproba_actions_v.detach() - target_entropy)
+    alpha_loss = (log_alpha * entropy_diff).mean()   # no outer ‘–’
+    alpha_loss.backward()
     alpha_optimizer.step()
 
     # unfreeze critic
@@ -192,13 +197,13 @@ def core_training_loop(
                   f"Q1-val range=[{qvalues1_dbg.min():.2f}, {qvalues1_dbg.max():.2f}], "
                   f"Q2-val range=[{qvalues2_dbg.min():.2f}, {qvalues2_dbg.max():.2f}], "
                   f"Target range=[{target_return_v.min():.2f}, {target_return_v.max():.2f}], "
-                  f"alpha={entropy_alpha.item():.4f}")
+                  f"log_prob mean: {logproba_actions_v.mean().item()}, entropy_alpha: {entropy_alpha.item()}, alpha_loss: {alpha_loss.item()}")
 
     return {
         'total_loss': total_loss_v.item(),
         'critic_loss': critic_loss_v.item(),
         'actor_loss': actor_loss_v.item(),
-        'entropy_loss': entropy_loss.item(),
+        'alpha_loss': alpha_loss.item(),
         'entropy_alpha': entropy_alpha.item(),
     }
 
@@ -282,17 +287,17 @@ if __name__ == "__main__":
     # SAC uses a learnable entropy temperature that tunes explore-exploit dynamically
     # Set up learnable log_alpha and optimizer for entropy tuning
     log_alpha = torch.tensor(LOG_ALPHA_START, requires_grad=True)
-    alpha_optimizer = optim.Adam([log_alpha], lr=3e-4)
+    alpha_optimizer = optim.Adam([log_alpha], lr=ENTROPY_LR)
 
     critic1_scheduler = optim.lr_scheduler.LinearLR(
         critic1_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
-        total_iters=LR_DECAY_FRAMES // batch_size)
+        total_iters=LR_DECAY_FRAMES // BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
     critic2_scheduler = optim.lr_scheduler.LinearLR(
         critic2_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
-        total_iters=LR_DECAY_FRAMES // batch_size)
+        total_iters=LR_DECAY_FRAMES // BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
     actor_scheduler = optim.lr_scheduler.LinearLR(
         actor_optimizer, start_factor=1.0, end_factor=ACTOR_LR_END / ACTOR_LR_START,
-        total_iters=LR_DECAY_FRAMES // batch_size)
+        total_iters=LR_DECAY_FRAMES // BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP)
 
     # Initialize performance tracker and print training header
     perf_tracker = PerformanceTracker()
@@ -339,8 +344,6 @@ if __name__ == "__main__":
 
         # Print periodic performance summary every 500 iterations
         if iter_no % 2000 == 0:
-            print("WARNING: RESETTING BUFFER!!")
-            replay_buffer.populate(REPLAY_BUFFER_SIZE)
             perf_tracker.print_checkpoint(int(iter_no), frame_idx)
 
         # Test trials to check success condition
@@ -369,7 +372,7 @@ if __name__ == "__main__":
                 f"losses: total={loss_dict['total_loss']:.4f}, "
                 f"critic={loss_dict['critic_loss']:.4f}, "
                 f"actor={loss_dict['actor_loss']:.4f}, "
-                f"entropy={loss_dict['entropy_loss']:.5f}, "
+                f"alpha_loss={loss_dict['alpha_loss']:.5f}, "
                 f"entropy_alpha={loss_dict['entropy_alpha']:.5f}"
             )
 
