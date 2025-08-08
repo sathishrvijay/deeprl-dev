@@ -43,11 +43,11 @@ N_ROLLOUT_STEPS = 8 # formal rollout definition;
 GAMMA = 0.99  # Slightly lower for Pendulum's shorter episodes
 # Separate learning rates for actor and critic
 # SAC doesn't usually require schedulers, pretty robust w/ static LRs
-CRITIC_LR_START = 3e-4
-CRITIC_LR_END = 1e-4
-ACTOR_LR_START = 3e-4
-ACTOR_LR_END = 1e-4
-ENTROPY_LR = 3e-4
+CRITIC_LR_START = 1e-4
+CRITIC_LR_END = 5e-5
+ACTOR_LR_START = 1e-4
+ACTOR_LR_END = 5e-5
+ENTROPY_LR = 1e-4
 LR_DECAY_FRAMES = int(5e7)
 
 # PG related - adjusted for continuous actions
@@ -56,9 +56,10 @@ CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 # Pendulum success threshold
 RNORM_SCALE_FACTOR = 1.0  # reward normalization scale factor
 # Automatic entropy temperature tuning
-LOG_ALPHA_START = 0.0  # Set a starting value for log_alpha
-TARGET_ENTROPY = -2.0  # -action_dim is default but too low in practice; n_actions is 1 for Pendulum
-ACTION_PENALTY_COEF = 0.01  # Prevents actor from going to max torque
+LOG_ALPHA_START = -2.0  # Set a starting value for log_alpha
+TARGET_ENTROPY = -3.0  # -action_dim is default but too low in practice; n_actions is 1 for Pendulum
+ACTION_PENALTY_COEF = 0.0   # disable to see if it can learn without this
+#ACTION_PENALTY_COEF = 0.01  # Prevents actor from going to max torque
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
 # Replay buffer related
@@ -126,19 +127,17 @@ def core_training_loop(
     entropy_alpha = log_alpha.exp().clamp(min=1e-3).detach()
 
     # Critic loss:
-    # y = r + gamma * minQT(s', Actor(a'|s')) - log pi(a'|s'); T <- Target net
+    # y = r + gamma * [minQT(s', Actor(a'|s')) - log pi(a'|s')]; T <- Target net
     # MSE(y - Q(s, Actor(a|s)))
     # s' <- from collected experience; a' <- from main actor using reparam trick
     target_net = tgt_net.target_model
     with torch.no_grad():
         ls_logproba_actions_v, ls_qv1_v, ls_qv2_v = target_net(last_states_v)
         # Add discounted last state Q value to partial return from trajectory
-        ls_qv1_v = (GAMMA ** N_TD_STEPS) * ls_qv1_v.squeeze(1).data
-        ls_qv2_v = (GAMMA ** N_TD_STEPS) * ls_qv2_v.squeeze(1).data
-        ls_qv1_v[done_masks_v], ls_qv2_v[done_masks_v] = 0.0, 0.0
-        target_return_v += torch.min(ls_qv1_v, ls_qv2_v)
-        # Use adaptive alpha
-        target_return_v -= entropy_alpha * ls_logproba_actions_v.squeeze(-1).data
+        ls_q_v = \
+            torch.min(ls_qv1_v, ls_qv2_v).squeeze(1) - entropy_alpha * ls_logproba_actions_v.squeeze(-1).data
+        ls_q_v[done_masks_v] = 0.0
+        target_return_v += (GAMMA ** N_TD_STEPS) * ls_q_v
 
     critic_loss_v = torch.tensor(0.0)
     for critic_id in [1, 2]:
@@ -154,11 +153,11 @@ def core_training_loop(
     for p in critic_params:
         p.requires_grad_(False)
 
-    logproba_actions_v, qvalues1_v, _ = tgt_net.model(states_v)
+    logproba_actions_v, qv1_v, qv2_v = tgt_net.model(states_v)
     # Current actions for action penalty
     mean_actions, _ = tgt_net.model.actor(states_v)
     action_penalty = ACTION_PENALTY_COEF * (mean_actions ** 2).mean()
-    actor_loss_v = -((qvalues1_v -
+    actor_loss_v = -((torch.min(qv1_v, qv2_v) -
         entropy_alpha * logproba_actions_v) / RNORM_SCALE_FACTOR).squeeze(-1).mean()
     actor_loss_v = actor_loss_v + action_penalty
 
