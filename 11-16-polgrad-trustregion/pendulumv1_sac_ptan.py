@@ -43,27 +43,27 @@ N_ROLLOUT_STEPS = 8 # formal rollout definition;
 GAMMA = 0.99  # Slightly lower for Pendulum's shorter episodes
 # Separate learning rates for actor and critic
 # SAC doesn't usually require schedulers, pretty robust w/ static LRs
-CRITIC_LR_START = 1e-4
+CRITIC_LR_START = 3e-4
 CRITIC_LR_END = 5e-5
-ACTOR_LR_START = 1e-4
+ACTOR_LR_START = 3e-4
 ACTOR_LR_END = 5e-5
-ENTROPY_LR = 1e-4
+ENTROPY_LR = 3e-4
 LR_DECAY_FRAMES = int(5e7)
 
 # PG related - adjusted for continuous actions
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # Pendulum success threshold
-RNORM_SCALE_FACTOR = 1.0  # reward normalization scale factor
+# RNORM_SCALE_FACTOR = 5.0  # reward normalization scale factor
 # Automatic entropy temperature tuning
-LOG_ALPHA_START = -2.0  # Set a starting value for log_alpha
-TARGET_ENTROPY = -3.0  # -action_dim is default but too low in practice; n_actions is 1 for Pendulum
+LOG_ALPHA_START = -1.0  # Set a starting value for log_alpha (exp(-1) = 0.368)
+TARGET_ENTROPY = -1.0  # -action_dim for 1D action space (Pendulum)
 ACTION_PENALTY_COEF = 0.0   # disable to see if it can learn without this
 #ACTION_PENALTY_COEF = 0.01  # Prevents actor from going to max torque
 PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
 
 # Replay buffer related
-BATCH_SIZE = 128  # training mini-batch size
+BATCH_SIZE = 256  # training mini-batch size
 REPLAY_BUFFER_SIZE = 10000
 BUF_ENTRIES_POPULATED_PER_TRAIN_LOOP = N_ENVS * N_ROLLOUT_STEPS  # 8 x 8
 
@@ -80,9 +80,8 @@ def critic_training_pass(tgt_net, critic_id: int, optimizers, schedulers,
     optimizer.zero_grad()
 
     qvalues_v = critic_net(states_v, actions_v)
-    # Note: Entropy Bonus term in return target also scales same as original target
-    critic_loss_v = nn.functional.mse_loss(qvalues_v.squeeze(-1) / RNORM_SCALE_FACTOR,
-                                           target_return_v / RNORM_SCALE_FACTOR)
+    # Remove reward normalization to avoid numerical instability
+    critic_loss_v = nn.functional.mse_loss(qvalues_v.squeeze(-1), target_return_v)
 
     # Safety check for NaN/Inf values
     if torch.isnan(critic_loss_v) or torch.isinf(critic_loss_v):
@@ -157,8 +156,8 @@ def core_training_loop(
     # Current actions for action penalty
     mean_actions, _ = tgt_net.model.actor(states_v)
     action_penalty = ACTION_PENALTY_COEF * (mean_actions ** 2).mean()
-    actor_loss_v = -((torch.min(qv1_v, qv2_v) -
-        entropy_alpha * logproba_actions_v) / RNORM_SCALE_FACTOR).squeeze(-1).mean()
+    actor_loss_v = -(torch.min(qv1_v, qv2_v) -
+        entropy_alpha * logproba_actions_v).squeeze(-1).mean()
     actor_loss_v = actor_loss_v + action_penalty
 
     actor_loss_v.backward()
@@ -359,7 +358,7 @@ if __name__ == "__main__":
             int(iter_no), frame_idx, average_return, training_time, eval_time, loss_dict
         )
 
-        if iter_no % 100 == 0:
+        if iter_no % 100== 0:
             # Enhanced logging with timing information and separate learning rates
             critic1_lr = critic1_optimizer.param_groups[0]["lr"]
             critic2_lr = critic2_optimizer.param_groups[0]["lr"]

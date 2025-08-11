@@ -131,14 +131,11 @@ class ContinuousA2CActor(nn.Module):
 
     def forward(self, x: torch.Tensor):
         features = self.backbone(x)
-
-        # Mean with tanh scaling to action bounds [-2, 2] for Pendulum
-        mean = torch.tanh(self.mean_head(features)) * 2.0
+        mean = self.mean_head(features)
 
         # Log variance with clamping to prevent extreme values
         log_var = self.log_var_head(features)
         log_var = torch.clamp(log_var, -5, 2)  # std in [0.007, 2.7] range
-
         return mean, log_var
 
 
@@ -186,11 +183,15 @@ class ContinuousA2C(nn.Module):
             actions_mean, actions_logvar = self.get_action_distribution(state)
 
             if deterministic:
-                return actions_mean
+                # For deterministic evaluation, apply tanh to mean
+                return torch.tanh(actions_mean) * 2.0
+
             else:
                 std = torch.exp(actions_logvar / 2)
                 eps = torch.randn_like(std)
-                return actions_mean + std * eps
+                raw_actions = actions_mean + std * eps
+                # Apply tanh squashing for bounded actions
+                actions = torch.tanh(raw_actions) * 2.0
 
     def get_actor_parameters(self):
         return self.actor.parameters()
@@ -226,35 +227,54 @@ class SAC(nn.Module):
             actions_mean, actions_logvar = self.get_action_distribution(state)
 
             if deterministic:
-                return actions_mean
+                # For deterministic evaluation, apply tanh to mean
+                return torch.tanh(actions_mean) * 2.0
             else:
                 std = torch.exp(actions_logvar / 2)
                 eps = torch.randn_like(std)
-                actions = actions_mean + std * eps
-                actions = torch.clamp(actions, -2, 2)
+                raw_actions = actions_mean + std * eps
+                # Apply tanh squashing for bounded actions
+                actions = torch.tanh(raw_actions) * 2.0
                 return actions
 
-    def compute_logproba_actions(self, actions, state: torch.Tensor):
-        """Compute log probabilities for continuous actions
-        Gaussian log probability: -0.5 * (log(2π) + log_var + (x-μ)²/σ²)"""
-        actions_mu, actions_logvar = self.get_action_distribution(state)
-        log_proba = -0.5 * (
+    def compute_logproba_raw_actions(self, raw_actions, actions_mu, actions_logvar):
+        """Compute log probabilities for raw actions with stable Jacobian correction
+        This avoids the numerical instability of atanh() by working directly with raw actions"""
+        
+        # Gaussian log probability for raw actions
+        log_proba_raw = -0.5 * (
             torch.log(torch.tensor(2 * math.pi)) +
             actions_logvar +
-            (actions - actions_mu).pow(2) / torch.exp(actions_logvar)
+            (raw_actions - actions_mu).pow(2) / torch.exp(actions_logvar)
         )
-        # Sum over action dimensions
-        log_proba = log_proba.sum(dim=-1)
-        return log_proba
+        
+        # Stable Jacobian correction for tanh squashing
+        # d/du[tanh(u) * 2] = 2 * (1 - tanh^2(u))
+        # log|J| = log(2 * (1 - tanh^2(u)))
+        tanh_raw = torch.tanh(raw_actions)
+        jacobian_correction = torch.log(2 * (1 - tanh_raw.pow(2)) + 1e-6)
+        
+        # Sum over action dimensions and apply correction
+        log_proba_squashed = (log_proba_raw + jacobian_correction).sum(dim=-1)
+        return log_proba_squashed
+
 
     def forward(self, x: torch.Tensor):
-        # sample actions from action pdfs for critic
-        actions = self.sample_action(x, deterministic=False)
-        qvalue_1 = self.critic_1(x, actions)
-        qvalue_2 = self.critic_2(x, actions)
+        # Sample raw actions once and keep reference (stable approach)
+        actions_mu, actions_logvar = self.get_action_distribution(x)
+        std = torch.exp(actions_logvar / 2)
+        eps = torch.randn_like(std)
+        raw_actions = actions_mu + std * eps
+        
+        # Apply tanh squashing for bounded actions
+        squashed_actions = torch.tanh(raw_actions) * 2.0
+        
+        # Get Q-values using squashed actions
+        qvalue_1 = self.critic_1(x, squashed_actions)
+        qvalue_2 = self.critic_2(x, squashed_actions)
 
-        # compute logproba
-        logproba_actions = self.compute_logproba_actions(actions, x)
+        # Compute log probabilities using raw actions (stable, no atanh)
+        logproba_actions = self.compute_logproba_raw_actions(raw_actions, actions_mu, actions_logvar)
         return logproba_actions, qvalue_1, qvalue_2
 
     def get_critic_net(self, critic_id: int = 1):
