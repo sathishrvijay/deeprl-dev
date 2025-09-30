@@ -15,6 +15,11 @@ from utils import PerformanceTracker, print_training_header, print_final_summary
 
 """This is the implementation of PPO with Pendulum-v1 RL for CA spaces using the PTAN wrapper
 libraries. Uses separate Actor and Critic networks with different optimizers and learning rates.
+TODO: 07/30
+- Start w/ core training loop mod - changes from A2C related to Actor Surrogate loss
+- Actor & critic nets and Agent - can be same as A2C
+- Experience collection - changes required here for full trajectory rollouts
+- unpack batch - requires GAE advantage calc here instead of simple Target return
 """
 
 # HPARAMS
