@@ -168,9 +168,15 @@ class ContinuousA2C(nn.Module):
         self.actor = ContinuousA2CActor(state_dim, action_dim, actor_hidden1_dim, actor_hidden2_dim)
 
     def forward(self, x: torch.Tensor):
+        # Sample raw actions once and keep reference (stable approach)
+        actions_mu, actions_logvar = self.get_action_distribution(x)
+        std = torch.exp(actions_logvar / 2)
+        eps = torch.randn_like(std)
+        raw_actions = actions_mu + std * eps
+        # Compute log probabilities using raw actions (stable, no atanh)
+        logproba_actions = self.compute_logproba_raw_actions(raw_actions, actions_mu, actions_logvar)
         value = self.critic(x)
-        actions_mean, actions_logvar = self.actor(x)
-        return actions_mean, actions_logvar, value
+        return logproba_actions, actions_mu, actions_logvar, value
 
     def get_action_distribution(self, x: torch.Tensor):
         actions_mean, actions_logvar = self.actor(x)
@@ -184,15 +190,36 @@ class ContinuousA2C(nn.Module):
 
             if deterministic:
                 # For deterministic evaluation, apply tanh to mean
-                return torch.tanh(actions_mean) * 2.0
+                return torch.tanh(actions_mean)
 
             else:
                 std = torch.exp(actions_logvar / 2)
                 eps = torch.randn_like(std)
                 raw_actions = actions_mean + std * eps
                 # Apply tanh squashing for bounded actions
-                actions = torch.tanh(raw_actions) * 2.0
+                actions = torch.tanh(raw_actions)
                 return actions
+
+    def compute_logproba_raw_actions(self, raw_actions, actions_mu, actions_logvar):
+        """Compute log probabilities for raw actions with stable Jacobian correction
+        This avoids the numerical instability of atanh() by working directly with raw actions"""
+        
+        # Gaussian log probability for raw actions
+        log_proba_raw = -0.5 * (
+            torch.log(torch.tensor(2 * math.pi)) +
+            actions_logvar +
+            (raw_actions - actions_mu).pow(2) / torch.exp(actions_logvar)
+        )
+        
+        # Stable Jacobian correction for tanh squashing
+        # d/du[tanh(u) * 2] = 2 * (1 - tanh^2(u))
+        # log|J| = log(2 * (1 - tanh^2(u)))
+        tanh_raw = torch.tanh(raw_actions)
+        jacobian_correction = torch.log(2 * (1 - tanh_raw.pow(2)) + 1e-6)
+        
+        # Sum over action dimensions and apply correction
+        log_proba_squashed = (log_proba_raw + jacobian_correction).sum(dim=-1)
+        return log_proba_squashed
 
     def get_actor_parameters(self):
         return self.actor.parameters()
@@ -258,7 +285,6 @@ class SAC(nn.Module):
         # Sum over action dimensions and apply correction
         log_proba_squashed = (log_proba_raw + jacobian_correction).sum(dim=-1)
         return log_proba_squashed
-
 
     def forward(self, x: torch.Tensor):
         # Sample raw actions once and keep reference (stable approach)

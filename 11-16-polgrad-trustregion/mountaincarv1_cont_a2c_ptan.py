@@ -13,7 +13,7 @@ from functools import partial
 from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
-"""This is the implementation of A2C with Pendulum-v1 RL using the PTAN wrapper libraries.
+"""This is the implementation of A2C with MountainCarContinuous-v1 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
 PG methods like A3C, DDPG, SAC, PPO and others.
 Modified to use separate Actor and Critic networks with different optimizers and learning rates.
@@ -21,7 +21,7 @@ Adapted for continuous action spaces using Gaussian policies with log variance p
 """
 
 # HPARAMS
-RL_ENV = "Pendulum-v1"
+RL_ENV = "MountainCarContinuous-v1"
 N_ENVS = 16
 
 # Separate network dimensions
@@ -33,7 +33,7 @@ ACTOR_HIDDEN2_DIM = 64
 N_TD_STEPS = 4 # Number of steps aggregated per experience (n in n-step TD)
 N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
 
-GAMMA = 0.99  # Slightly lower for Pendulum's shorter episodes
+GAMMA = 0.99  # Slightly lower for MountainCarContinuous's shorter episodes
 # Separate learning rates for actor and critic
 CRITIC_LR_START = 7e-4
 CRITIC_LR_END = 1e-4
@@ -47,8 +47,8 @@ ENTROPY_BONUS_BETA_END = 1e-4    # Lower final exploration
 ENTROPY_DECAY_FRAMES = 2e6       # Decay over 2M frames
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
-# Pendulum success threshold
-PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
+# MountainCarContinuous success threshold (one time +100 bonus for climbing the hill w/ small energy penalty otherwise)
+SOLVED_REWARD = 90.0  
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -120,45 +120,32 @@ def core_training_loop(
     critic_optimizer.zero_grad()
 
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
-    actions_mu_v, actions_logvar_v, values_v = net(states_v)
+    logproba_actions_v, actions_mu_v, actions_logvar_v, values_v = net(states_v)
 
     # Compute current entropy bonus with decay
     entropy_progress = min(1.0, frame_idx / ENTROPY_DECAY_FRAMES)
     current_entropy_beta = ENTROPY_BONUS_BETA_START * (1 - entropy_progress) + ENTROPY_BONUS_BETA_END * entropy_progress
 
     # Critic loss - same as discrete case
-    if reward_norm:
-        # Pendulum rewards are in [-16, 0] range, so normalize differently than LunarLander
-        values_v = values_v / 16.0
-        target_return_v = target_return_v / 16.0
     critic_loss_v = nn.functional.mse_loss(values_v.squeeze(-1), target_return_v)
 
     # Compute advantages
     adv_v = target_return_v - values_v.squeeze(-1).detach()
-    # Normalize advantages
+    # Normalize advantages (Standard for PPO, A2C etc)
     adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
     adv_v = (adv_v - adv_v.mean()) / adv_std
 
     # Compute log probabilities for continuous actions
-    # Gaussian log probability: -0.5 * (log(2π) + log_var + (x-μ)²/σ²)
-    log_prob_v = -0.5 * (
-        torch.log(torch.tensor(2 * math.pi)) +
-        actions_logvar_v +
-        (actions_v - actions_mu_v).pow(2) / torch.exp(actions_logvar_v)
-    )
-    log_prob_v = log_prob_v.sum(dim=-1)  # Sum over action dimensions
+    logproba_actions_v = logproba_actions_v.sum(dim=-1)  # Sum over action dimensions
 
     # Policy gradient loss
-    pg_loss_v = -(adv_v * log_prob_v).mean()
+    pg_loss_v = -(adv_v * logproba_actions_v).mean()
 
     # Entropy bonus for continuous actions
     # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
     entropy_v = 0.5 * (actions_logvar_v + math.log(2 * math.pi * math.e))
     entropy_v = entropy_v.sum(dim=-1).mean()  # Sum over action dims, mean over batch
     entropy_bonus_v = current_entropy_beta * entropy_v
-
-    # Variance regularization to prevent collapse
-    var_penalty_v = 1e-4 * torch.exp(actions_logvar_v).mean()
 
     # Separate loss computation and backpropagation
     # Critic loss (only affects critic network)
@@ -168,7 +155,7 @@ def core_training_loop(
     critic_scheduler.step()
 
     # Actor loss (only affects actor network)
-    actor_loss_v = pg_loss_v - entropy_bonus_v + var_penalty_v
+    actor_loss_v = pg_loss_v - entropy_bonus_v
     actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(net.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
@@ -191,7 +178,6 @@ def core_training_loop(
         'actor_loss': actor_loss_v.item(),
         'entropy_raw': entropy_v.item(),
         'entropy_loss': entropy_bonus_v.item(),
-        'var_penalty': var_penalty_v.item(),
         'current_entropy_beta': current_entropy_beta
     }
 
@@ -241,8 +227,8 @@ if __name__ == "__main__":
     test_env = gym.make(RL_ENV)
 
     # setup the agent and target net - using continuous action networks
-    n_states = vector_env.single_observation_space.shape[0]  # Pendulum has Box(3,) observation space
-    n_actions = vector_env.single_action_space.shape[0]      # Pendulum has Box(1,) action space
+    n_states = vector_env.single_observation_space.shape[0]  # MountainCarContinuous has Box(2,) observation space
+    n_actions = vector_env.single_action_space.shape[0]      # MountainCarContinuous has Box(1,) action space
     net = pgtr_models.ContinuousA2C(
         n_states, n_actions,
         CRITIC_HIDDEN1_DIM, CRITIC_HIDDEN2_DIM,
@@ -295,7 +281,7 @@ if __name__ == "__main__":
         'entropy_beta_end': ENTROPY_BONUS_BETA_END,
         'entropy_decay_frames': ENTROPY_DECAY_FRAMES,
         'clip_grad': CLIP_GRAD,
-        'solved_threshold': PENDULUM_SOLVED_REWARD
+        'solved_threshold': SOLVED_REWARD
     }
     print_training_header(RL_ENV, network_config, hyperparams)
 
@@ -355,7 +341,7 @@ if __name__ == "__main__":
                 f"entropy_β={loss_dict['current_entropy_beta']:.4e}"
             )
 
-        solved = average_return > PENDULUM_SOLVED_REWARD  # Pendulum is solved when avg reward > -200
+        solved = average_return > SOLVED_REWARD  # MountainCarContinuous is solved when avg reward > 90
 
     # Training completed - print comprehensive summary using utility function
     final_summary = perf_tracker.get_summary()
@@ -364,7 +350,7 @@ if __name__ == "__main__":
     print_final_summary(
         solved=solved,
         average_return=average_return,
-        target_reward=PENDULUM_SOLVED_REWARD,
+        target_reward=SOLVED_REWARD,
         final_summary=final_summary,
         frame_idx=frame_idx,
         current_alpha=(actor_lr, critic_lr),
