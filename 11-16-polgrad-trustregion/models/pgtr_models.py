@@ -192,6 +192,7 @@ class ContinuousA2C(nn.Module):
                 raw_actions = actions_mean + std * eps
                 # Apply tanh squashing for bounded actions
                 actions = torch.tanh(raw_actions) * 2.0
+                return actions
 
     def get_actor_parameters(self):
         return self.actor.parameters()
