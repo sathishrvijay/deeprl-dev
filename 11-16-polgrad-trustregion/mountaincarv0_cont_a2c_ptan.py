@@ -13,7 +13,7 @@ from functools import partial
 from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
-"""This is the implementation of A2C with MountainCarContinuous-v1 RL using the PTAN wrapper libraries.
+"""This is the implementation of A2C with MountainCarContinuous-v0 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
 PG methods like A3C, DDPG, SAC, PPO and others.
 Modified to use separate Actor and Critic networks with different optimizers and learning rates.
@@ -21,7 +21,7 @@ Adapted for continuous action spaces using Gaussian policies with log variance p
 """
 
 # HPARAMS
-RL_ENV = "MountainCarContinuous-v1"
+RL_ENV = "MountainCarContinuous-v0"
 N_ENVS = 16
 
 # Separate network dimensions
@@ -87,7 +87,7 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
     # return states, actions, returns
     with torch.no_grad():
-        _, _, ls_values_v = net(last_states_v)
+        _, _, _, ls_values_v = net(last_states_v)
 
     ls_values_v = ls_values_v.squeeze(1).data
     # Note: important step for computing returns correctly w/ loop unroll
@@ -250,7 +250,7 @@ if __name__ == "__main__":
     critic_optimizer = optim.RMSprop(net.get_critic_parameters(), lr=CRITIC_LR_START, eps=1e-5, alpha=0.99)
     actor_optimizer = optim.Adam(net.get_actor_parameters(), lr=ACTOR_LR_START, eps=1e-5)
 
-    max_return = -1000.0
+    max_return = -100.0
 
     # each iteration of exp_source yields N_ENVS experiences
     batch_size = N_ROLLOUT_STEPS * N_ENVS
@@ -337,7 +337,6 @@ if __name__ == "__main__":
                 f"actor={loss_dict['actor_loss']:.4f}, "
                 f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
                 f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
-                f"var_penalty={loss_dict['var_penalty']:.4e}, "
                 f"entropy_β={loss_dict['current_entropy_beta']:.4e}"
             )
 
