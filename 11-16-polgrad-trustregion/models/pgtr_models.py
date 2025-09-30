@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 class DiscreteA2CCritic(nn.Module):
     """Separate Critic Network for A2C with discrete actions."""
@@ -130,14 +131,11 @@ class ContinuousA2CActor(nn.Module):
 
     def forward(self, x: torch.Tensor):
         features = self.backbone(x)
-
-        # Mean with tanh scaling to action bounds [-2, 2] for Pendulum
-        mean = torch.tanh(self.mean_head(features)) * 2.0
+        mean = self.mean_head(features)
 
         # Log variance with clamping to prevent extreme values
         log_var = self.log_var_head(features)
         log_var = torch.clamp(log_var, -5, 2)  # std in [0.007, 2.7] range
-
         return mean, log_var
 
 
@@ -179,22 +177,126 @@ class ContinuousA2C(nn.Module):
         return actions_mean, actions_logvar
 
     def sample_action(self, state: torch.Tensor, deterministic: bool = False):
-        """Sample action from the policy. Used for evaluation and action selection."""
+        """Sample action from the policy using the Reparametrizion trick for differentiability
+        Used for evaluation and action selection."""
         with torch.no_grad():
             actions_mean, actions_logvar = self.get_action_distribution(state)
 
             if deterministic:
-                return actions_mean
+                # For deterministic evaluation, apply tanh to mean
+                return torch.tanh(actions_mean) * 2.0
+
             else:
                 std = torch.exp(actions_logvar / 2)
                 eps = torch.randn_like(std)
-                return actions_mean + std * eps
+                raw_actions = actions_mean + std * eps
+                # Apply tanh squashing for bounded actions
+                actions = torch.tanh(raw_actions) * 2.0
+                return actions
 
     def get_actor_parameters(self):
         return self.actor.parameters()
 
     def get_critic_parameters(self):
         return self.critic.parameters()
+
+
+class SAC(nn.Module):
+    """Wrapper class for separate Actor and Critic networks to maintain PTAN compatibility.
+        Note: Bascically identical to ContinuousA2C structure with 2 critic nets.
+        - Actor net is same as A2C
+        - Critic net is same as DDPG
+        """
+    def __init__(self, state_dim: int, action_dim: int,
+                 critic_hidden1_dim: int = 128, critic_hidden2_dim: int = 32,
+                 actor_hidden1_dim: int = 128, actor_hidden2_dim: int = 64):
+        super(SAC, self).__init__()
+        self.action_dim = action_dim
+        self.critic_1 = DDPGCritic(state_dim, action_dim, critic_hidden1_dim, critic_hidden2_dim)
+        self.critic_2 = DDPGCritic(state_dim, action_dim, critic_hidden1_dim, critic_hidden2_dim)
+        self.actor = ContinuousA2CActor(state_dim, action_dim, actor_hidden1_dim,
+                                        actor_hidden2_dim)
+
+    def get_action_distribution(self, x: torch.Tensor):
+        actions_mean, actions_logvar = self.actor(x)
+        return actions_mean, actions_logvar
+
+    def sample_action(self, state: torch.Tensor, deterministic: bool = False):
+        """Sample action from the policy using the Reparametrizion trick for differentiability
+        Used for evaluation and action selection."""
+        with torch.no_grad():
+            actions_mean, actions_logvar = self.get_action_distribution(state)
+
+            if deterministic:
+                # For deterministic evaluation, apply tanh to mean
+                return torch.tanh(actions_mean) * 2.0
+            else:
+                std = torch.exp(actions_logvar / 2)
+                eps = torch.randn_like(std)
+                raw_actions = actions_mean + std * eps
+                # Apply tanh squashing for bounded actions
+                actions = torch.tanh(raw_actions) * 2.0
+                return actions
+
+    def compute_logproba_raw_actions(self, raw_actions, actions_mu, actions_logvar):
+        """Compute log probabilities for raw actions with stable Jacobian correction
+        This avoids the numerical instability of atanh() by working directly with raw actions"""
+        
+        # Gaussian log probability for raw actions
+        log_proba_raw = -0.5 * (
+            torch.log(torch.tensor(2 * math.pi)) +
+            actions_logvar +
+            (raw_actions - actions_mu).pow(2) / torch.exp(actions_logvar)
+        )
+        
+        # Stable Jacobian correction for tanh squashing
+        # d/du[tanh(u) * 2] = 2 * (1 - tanh^2(u))
+        # log|J| = log(2 * (1 - tanh^2(u)))
+        tanh_raw = torch.tanh(raw_actions)
+        jacobian_correction = torch.log(2 * (1 - tanh_raw.pow(2)) + 1e-6)
+        
+        # Sum over action dimensions and apply correction
+        log_proba_squashed = (log_proba_raw + jacobian_correction).sum(dim=-1)
+        return log_proba_squashed
+
+
+    def forward(self, x: torch.Tensor):
+        # Sample raw actions once and keep reference (stable approach)
+        actions_mu, actions_logvar = self.get_action_distribution(x)
+        std = torch.exp(actions_logvar / 2)
+        eps = torch.randn_like(std)
+        raw_actions = actions_mu + std * eps
+        
+        # Apply tanh squashing for bounded actions
+        squashed_actions = torch.tanh(raw_actions) * 2.0
+        
+        # Get Q-values using squashed actions
+        qvalue_1 = self.critic_1(x, squashed_actions)
+        qvalue_2 = self.critic_2(x, squashed_actions)
+
+        # Compute log probabilities using raw actions (stable, no atanh)
+        logproba_actions = self.compute_logproba_raw_actions(raw_actions, actions_mu, actions_logvar)
+        return logproba_actions, qvalue_1, qvalue_2
+
+    def get_critic_net(self, critic_id: int = 1):
+        if critic_id == 1:
+            return self.critic_1
+        else:
+            assert(critic_id == 2)
+            return self.critic_2
+
+    def get_actor_net(self):
+        return self.actor
+
+    def get_actor_parameters(self):
+        return self.actor.parameters()
+
+    def get_critic_parameters(self, critic_id: int = 1):
+        if critic_id == 1:
+            return self.critic_1.parameters()
+        else:
+            assert(critic_id == 2)
+            return self.critic_2.parameters()
 
 
 class DDPGActor(nn.Module):
