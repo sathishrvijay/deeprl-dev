@@ -125,17 +125,20 @@ class ContinuousA2CActor(nn.Module):
         self.mean_head = nn.Linear(hidden2_dim, action_dim)
         self.log_var_head = nn.Linear(hidden2_dim, action_dim)
 
-        # Initialize log_var to reasonable values (std ≈ 0.6)
-        nn.init.constant_(self.log_var_head.bias, -1.0)  # log(0.37) ≈ -1
+        # Initialize log_var to reasonable values for stable exploration
+        # Start with std ≈ 0.3 for conservative initial exploration
+        nn.init.constant_(self.log_var_head.bias, -2.2)  # log(0.11) ≈ -2.2, std ≈ 0.33
         nn.init.xavier_uniform_(self.log_var_head.weight, gain=0.01)  # Small initial weights
 
     def forward(self, x: torch.Tensor):
         features = self.backbone(x)
         mean = self.mean_head(features)
 
-        # Log variance with clamping to prevent extreme values
+        # Log variance with soft bounds to prevent extreme values while preserving gradients
         log_var = self.log_var_head(features)
-        log_var = torch.clamp(log_var, -5, 2)  # std in [0.007, 2.7] range
+        # Use tanh-based soft clamping to avoid gradient death
+        # Maps (-∞, ∞) → (-4, 1) smoothly, preserving gradients everywhere
+        log_var = torch.tanh(log_var / 2.0) * 2.5 - 1.5  # std range ≈ [0.02, 1.6]
         return mean, log_var
 
 

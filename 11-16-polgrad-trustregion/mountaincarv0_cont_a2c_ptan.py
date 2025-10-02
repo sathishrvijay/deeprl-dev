@@ -42,9 +42,9 @@ ACTOR_LR_END = 5e-5
 LR_DECAY_FRAMES = 5e7
 
 # PG related - adjusted for continuous actions
-ENTROPY_BONUS_BETA_START = 1e-2  # Higher initial exploration
-ENTROPY_BONUS_BETA_END = 1e-4    # Lower final exploration
-ENTROPY_DECAY_FRAMES = 2e6       # Decay over 2M frames
+ENTROPY_BONUS_BETA_START = 3e-3  # Higher initial exploration
+ENTROPY_BONUS_BETA_END = 1e-5    # Lower final exploration
+ENTROPY_DECAY_FRAMES = 1e6       # Decay over 1M frames
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # MountainCarContinuous success threshold (one time +100 bonus for climbing the hill w/ small energy penalty otherwise)
@@ -147,6 +147,12 @@ def core_training_loop(
     entropy_v = entropy_v.sum(dim=-1).mean()  # Sum over action dims, mean over batch
     entropy_bonus_v = current_entropy_beta * entropy_v
 
+    # Variance regularization to prevent excessive exploration (reduced penalty)
+    var_penalty_v = 1e-5 * torch.exp(actions_logvar_v).mean()
+    
+    # Action regularization to prevent extreme actions outside reasonable bounds [-0.8, 0.8]
+    action_reg_v = 1e-4 * torch.clamp(actions_mu_v.abs() - 0.8, min=0.0).mean()
+
     # Separate loss computation and backpropagation
     # Critic loss (only affects critic network)
     critic_loss_v.backward()
@@ -155,7 +161,7 @@ def core_training_loop(
     critic_scheduler.step()
 
     # Actor loss (only affects actor network)
-    actor_loss_v = pg_loss_v - entropy_bonus_v
+    actor_loss_v = pg_loss_v - entropy_bonus_v + var_penalty_v + action_reg_v
     actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(net.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
@@ -165,7 +171,7 @@ def core_training_loop(
     total_loss_v = critic_loss_v + actor_loss_v
 
     # Debug - check policy statistics
-    if debug and iter_no % 100 == 0:
+    if debug and iter_no is not None and iter_no % 100 == 0:
         with torch.no_grad():
             mean_action = actions_mu_v.mean(dim=0).cpu().numpy()
             std_action = torch.exp(actions_logvar_v / 2).mean(dim=0).cpu().numpy()
@@ -178,6 +184,8 @@ def core_training_loop(
         'actor_loss': actor_loss_v.item(),
         'entropy_raw': entropy_v.item(),
         'entropy_loss': entropy_bonus_v.item(),
+        'var_penalty': var_penalty_v.item(),
+        'action_reg': action_reg_v.item(),
         'current_entropy_beta': current_entropy_beta
     }
 
@@ -194,7 +202,7 @@ def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     reward = 0.0
     episode_count = 0
     exp_iterator = iter(exp_source)
-    while episode_count < 10:  # Reduced from 20 to 10 for faster evaluation
+    while episode_count < 20:
         while True:
             exp = next(exp_iterator)
             reward += exp.reward
@@ -227,8 +235,10 @@ if __name__ == "__main__":
     test_env = gym.make(RL_ENV)
 
     # setup the agent and target net - using continuous action networks
-    n_states = vector_env.single_observation_space.shape[0]  # MountainCarContinuous has Box(2,) observation space
-    n_actions = vector_env.single_action_space.shape[0]      # MountainCarContinuous has Box(1,) action space
+    obs_space = vector_env.single_observation_space
+    action_space = vector_env.single_action_space
+    n_states = obs_space.shape[0] if obs_space.shape is not None else 2  # MountainCarContinuous has Box(2,) observation space
+    n_actions = action_space.shape[0] if action_space.shape is not None else 1      # MountainCarContinuous has Box(1,) action space
     net = pgtr_models.ContinuousA2C(
         n_states, n_actions,
         CRITIC_HIDDEN1_DIM, CRITIC_HIDDEN2_DIM,
@@ -244,6 +254,7 @@ if __name__ == "__main__":
     iter_no = 0.0
     trial = 0
     solved = False
+    average_return = -100.0  # Initialize to handle potential unbound variable
 
     # Separate optimizers for actor and critic
     # A2C reports more stable results w/ RMSProp for critic, Adam for actor
@@ -258,10 +269,10 @@ if __name__ == "__main__":
     # Separate schedulers for actor and critic
     critic_scheduler = optim.lr_scheduler.LinearLR(
         critic_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
-        total_iters=LR_DECAY_FRAMES // batch_size)
+        total_iters=int(LR_DECAY_FRAMES // batch_size))
     actor_scheduler = optim.lr_scheduler.LinearLR(
         actor_optimizer, start_factor=1.0, end_factor=ACTOR_LR_END / ACTOR_LR_START,
-        total_iters=LR_DECAY_FRAMES // batch_size)
+        total_iters=int(LR_DECAY_FRAMES // batch_size))
 
     # Initialize performance tracker and print training header
     perf_tracker = PerformanceTracker()
@@ -337,6 +348,8 @@ if __name__ == "__main__":
                 f"actor={loss_dict['actor_loss']:.4f}, "
                 f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
                 f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
+                f"var_penalty={loss_dict['var_penalty']:.4e}, "
+                f"action_reg={loss_dict['action_reg']:.4e}, "
                 f"entropy_β={loss_dict['current_entropy_beta']:.4e}"
             )
 
