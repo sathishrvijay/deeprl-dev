@@ -13,7 +13,7 @@ from functools import partial
 from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
 
-"""This is the implementation of A2C with Pendulum-v1 RL using the PTAN wrapper libraries.
+"""This is the implementation of A2C with MountainCarContinuous-v0 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
 PG methods like A3C, DDPG, SAC, PPO and others.
 Modified to use separate Actor and Critic networks with different optimizers and learning rates.
@@ -21,7 +21,7 @@ Adapted for continuous action spaces using Gaussian policies with log variance p
 """
 
 # HPARAMS
-RL_ENV = "Pendulum-v1"
+RL_ENV = "MountainCarContinuous-v0"
 N_ENVS = 16
 
 # Separate network dimensions
@@ -33,7 +33,7 @@ ACTOR_HIDDEN2_DIM = 64
 N_TD_STEPS = 4 # Number of steps aggregated per experience (n in n-step TD)
 N_ROLLOUT_STEPS = 16 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
 
-GAMMA = 0.99  # Slightly lower for Pendulum's shorter episodes
+GAMMA = 0.99  # Slightly lower for MountainCarContinuous's shorter episodes
 # Separate learning rates for actor and critic
 CRITIC_LR_START = 7e-4
 CRITIC_LR_END = 1e-4
@@ -42,13 +42,13 @@ ACTOR_LR_END = 5e-5
 LR_DECAY_FRAMES = 5e7
 
 # PG related - adjusted for continuous actions
-ENTROPY_BONUS_BETA_START = 1e-2  # Higher initial exploration
-ENTROPY_BONUS_BETA_END = 1e-4    # Lower final exploration
-ENTROPY_DECAY_FRAMES = 2e6       # Decay over 2M frames
+ENTROPY_BONUS_BETA_START = 3e-3  # Higher initial exploration
+ENTROPY_BONUS_BETA_END = 1e-5    # Lower final exploration
+ENTROPY_DECAY_FRAMES = 1e6       # Decay over 1M frames
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
-# Pendulum success threshold
-PENDULUM_SOLVED_REWARD = -200.0  # Pendulum is solved when avg reward > -200
+# MountainCarContinuous success threshold (one time +100 bonus for climbing the hill w/ small energy penalty otherwise)
+SOLVED_REWARD = 90.0  
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -87,7 +87,7 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
     # return states, actions, returns
     with torch.no_grad():
-        _, _, ls_values_v = net(last_states_v)
+        _, _, _, ls_values_v = net(last_states_v)
 
     ls_values_v = ls_values_v.squeeze(1).data
     # Note: important step for computing returns correctly w/ loop unroll
@@ -120,36 +120,26 @@ def core_training_loop(
     critic_optimizer.zero_grad()
 
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
-    actions_mu_v, actions_logvar_v, values_v = net(states_v)
+    logproba_actions_v, actions_mu_v, actions_logvar_v, values_v = net(states_v)
 
     # Compute current entropy bonus with decay
     entropy_progress = min(1.0, frame_idx / ENTROPY_DECAY_FRAMES)
     current_entropy_beta = ENTROPY_BONUS_BETA_START * (1 - entropy_progress) + ENTROPY_BONUS_BETA_END * entropy_progress
 
     # Critic loss - same as discrete case
-    if reward_norm:
-        # Pendulum rewards are in [-16, 0] range, so normalize differently than LunarLander
-        values_v = values_v / 16.0
-        target_return_v = target_return_v / 16.0
     critic_loss_v = nn.functional.mse_loss(values_v.squeeze(-1), target_return_v)
 
     # Compute advantages
     adv_v = target_return_v - values_v.squeeze(-1).detach()
-    # Normalize advantages
+    # Normalize advantages (Standard for PPO, A2C etc)
     adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
     adv_v = (adv_v - adv_v.mean()) / adv_std
 
     # Compute log probabilities for continuous actions
-    # Gaussian log probability: -0.5 * (log(2π) + log_var + (x-μ)²/σ²)
-    log_prob_v = -0.5 * (
-        torch.log(torch.tensor(2 * math.pi)) +
-        actions_logvar_v +
-        (actions_v - actions_mu_v).pow(2) / torch.exp(actions_logvar_v)
-    )
-    log_prob_v = log_prob_v.sum(dim=-1)  # Sum over action dimensions
+    logproba_actions_v = logproba_actions_v.sum(dim=-1)  # Sum over action dimensions
 
     # Policy gradient loss
-    pg_loss_v = -(adv_v * log_prob_v).mean()
+    pg_loss_v = -(adv_v * logproba_actions_v).mean()
 
     # Entropy bonus for continuous actions
     # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
@@ -157,8 +147,11 @@ def core_training_loop(
     entropy_v = entropy_v.sum(dim=-1).mean()  # Sum over action dims, mean over batch
     entropy_bonus_v = current_entropy_beta * entropy_v
 
-    # Variance regularization to prevent collapse
-    var_penalty_v = 1e-4 * torch.exp(actions_logvar_v).mean()
+    # Variance regularization to prevent excessive exploration (reduced penalty)
+    var_penalty_v = 1e-5 * torch.exp(actions_logvar_v).mean()
+    
+    # Action regularization to prevent extreme actions outside reasonable bounds [-0.8, 0.8]
+    action_reg_v = 1e-4 * torch.clamp(actions_mu_v.abs() - 0.8, min=0.0).mean()
 
     # Separate loss computation and backpropagation
     # Critic loss (only affects critic network)
@@ -168,7 +161,7 @@ def core_training_loop(
     critic_scheduler.step()
 
     # Actor loss (only affects actor network)
-    actor_loss_v = pg_loss_v - entropy_bonus_v + var_penalty_v
+    actor_loss_v = pg_loss_v - entropy_bonus_v + var_penalty_v + action_reg_v
     actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(net.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
@@ -178,7 +171,7 @@ def core_training_loop(
     total_loss_v = critic_loss_v + actor_loss_v
 
     # Debug - check policy statistics
-    if debug and iter_no % 100 == 0:
+    if debug and iter_no is not None and iter_no % 100 == 0:
         with torch.no_grad():
             mean_action = actions_mu_v.mean(dim=0).cpu().numpy()
             std_action = torch.exp(actions_logvar_v / 2).mean(dim=0).cpu().numpy()
@@ -192,6 +185,7 @@ def core_training_loop(
         'entropy_raw': entropy_v.item(),
         'entropy_loss': entropy_bonus_v.item(),
         'var_penalty': var_penalty_v.item(),
+        'action_reg': action_reg_v.item(),
         'current_entropy_beta': current_entropy_beta
     }
 
@@ -208,7 +202,7 @@ def play_trials(test_env: gym.Env, net: nn.Module) -> float:
     reward = 0.0
     episode_count = 0
     exp_iterator = iter(exp_source)
-    while episode_count < 10:  # Reduced from 20 to 10 for faster evaluation
+    while episode_count < 20:
         while True:
             exp = next(exp_iterator)
             reward += exp.reward
@@ -241,8 +235,10 @@ if __name__ == "__main__":
     test_env = gym.make(RL_ENV)
 
     # setup the agent and target net - using continuous action networks
-    n_states = vector_env.single_observation_space.shape[0]  # Pendulum has Box(3,) observation space
-    n_actions = vector_env.single_action_space.shape[0]      # Pendulum has Box(1,) action space
+    obs_space = vector_env.single_observation_space
+    action_space = vector_env.single_action_space
+    n_states = obs_space.shape[0] if obs_space.shape is not None else 2  # MountainCarContinuous has Box(2,) observation space
+    n_actions = action_space.shape[0] if action_space.shape is not None else 1      # MountainCarContinuous has Box(1,) action space
     net = pgtr_models.ContinuousA2C(
         n_states, n_actions,
         CRITIC_HIDDEN1_DIM, CRITIC_HIDDEN2_DIM,
@@ -258,13 +254,14 @@ if __name__ == "__main__":
     iter_no = 0.0
     trial = 0
     solved = False
+    average_return = -100.0  # Initialize to handle potential unbound variable
 
     # Separate optimizers for actor and critic
     # A2C reports more stable results w/ RMSProp for critic, Adam for actor
     critic_optimizer = optim.RMSprop(net.get_critic_parameters(), lr=CRITIC_LR_START, eps=1e-5, alpha=0.99)
     actor_optimizer = optim.Adam(net.get_actor_parameters(), lr=ACTOR_LR_START, eps=1e-5)
 
-    max_return = -1000.0
+    max_return = -100.0
 
     # each iteration of exp_source yields N_ENVS experiences
     batch_size = N_ROLLOUT_STEPS * N_ENVS
@@ -272,10 +269,10 @@ if __name__ == "__main__":
     # Separate schedulers for actor and critic
     critic_scheduler = optim.lr_scheduler.LinearLR(
         critic_optimizer, start_factor=1.0, end_factor=CRITIC_LR_END / CRITIC_LR_START,
-        total_iters=LR_DECAY_FRAMES // batch_size)
+        total_iters=int(LR_DECAY_FRAMES // batch_size))
     actor_scheduler = optim.lr_scheduler.LinearLR(
         actor_optimizer, start_factor=1.0, end_factor=ACTOR_LR_END / ACTOR_LR_START,
-        total_iters=LR_DECAY_FRAMES // batch_size)
+        total_iters=int(LR_DECAY_FRAMES // batch_size))
 
     # Initialize performance tracker and print training header
     perf_tracker = PerformanceTracker()
@@ -295,7 +292,7 @@ if __name__ == "__main__":
         'entropy_beta_end': ENTROPY_BONUS_BETA_END,
         'entropy_decay_frames': ENTROPY_DECAY_FRAMES,
         'clip_grad': CLIP_GRAD,
-        'solved_threshold': PENDULUM_SOLVED_REWARD
+        'solved_threshold': SOLVED_REWARD
     }
     print_training_header(RL_ENV, network_config, hyperparams)
 
@@ -352,10 +349,11 @@ if __name__ == "__main__":
                 f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
                 f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
                 f"var_penalty={loss_dict['var_penalty']:.4e}, "
+                f"action_reg={loss_dict['action_reg']:.4e}, "
                 f"entropy_β={loss_dict['current_entropy_beta']:.4e}"
             )
 
-        solved = average_return > PENDULUM_SOLVED_REWARD  # Pendulum is solved when avg reward > -200
+        solved = average_return > SOLVED_REWARD  # MountainCarContinuous is solved when avg reward > 90
 
     # Training completed - print comprehensive summary using utility function
     final_summary = perf_tracker.get_summary()
@@ -364,7 +362,7 @@ if __name__ == "__main__":
     print_final_summary(
         solved=solved,
         average_return=average_return,
-        target_reward=PENDULUM_SOLVED_REWARD,
+        target_reward=SOLVED_REWARD,
         final_summary=final_summary,
         frame_idx=frame_idx,
         current_alpha=(actor_lr, critic_lr),
