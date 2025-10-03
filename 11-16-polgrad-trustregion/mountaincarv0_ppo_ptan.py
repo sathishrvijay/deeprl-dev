@@ -6,6 +6,7 @@ import torch.optim as optim
 import numpy as np
 import time
 import math
+from dataclasses import dataclass
 
 import typing as tt
 from functools import partial
@@ -51,6 +52,42 @@ SOLVED_REWARD = 90.0
 MAX_TRAINING_FRAMES = 5e7
 MINIBATCH_SIZE = 64
 MAX_EPOCHS_PER_BATCH = 256          # Reuse each observation average of 16 times per training batch
+
+
+@dataclass
+class PPOBatch:
+    """Container for all batch data needed for PPO training. 
+    Note: Unlike other algorithms, PPO needs to keep track of old log probabilities and values for 
+    the surrogate loss calculation. Computing and storing once per batch is much more efficient than
+    recomputing for every minibatch since the data is reused for multiple epochs."""
+    states: torch.Tensor
+    actions: torch.Tensor
+    old_logprobas: torch.Tensor
+    old_values: torch.Tensor
+    target_returns: torch.Tensor
+    advantages: torch.Tensor
+    
+    def __len__(self):
+        return len(self.states)
+    
+    def sample_minibatch(self, minibatch_size: int):
+        """Sample a random minibatch from this batch data"""
+        batch_size = len(self)
+        if batch_size <= minibatch_size:
+            # Return all indices if batch is smaller than minibatch size
+            indices = torch.arange(batch_size)
+        else:
+            # Randomly sample indices without replacement
+            indices = torch.randperm(batch_size)[:minibatch_size]
+        
+        return PPOBatch(
+            states=self.states[indices],
+            actions=self.actions[indices],
+            old_logprobas=self.old_logprobas[indices],
+            old_values=self.old_values[indices],
+            target_returns=self.target_returns[indices],
+            advantages=self.advantages[indices]
+        )
 
 
 def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
@@ -100,6 +137,48 @@ def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
 
     returns_v = rewards_v + ls_values_v
     return states_v, actions_v, returns_v
+
+
+def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: nn.Module) -> PPOBatch:
+    """Convert raw experience batch into structured PPOBatch for PPO training.
+    This computes all necessary data once per batch collection, including old policy
+    log probabilities and values that are needed for PPO's surrogate loss calculation.
+    
+    Args:
+        batch: List of experiences collected from parallel environments
+        net: The policy network (before any updates in this training iteration)
+        
+    Returns:
+        PPOBatch containing all preprocessed data ready for multiple epochs of training
+    """
+    # Unpack the raw experience batch
+    states_v, actions_v, target_returns_v = unpack_batch(batch, net, N_TD_STEPS)
+    
+    # Compute old policy data (before any parameter updates)
+    # This is crucial for PPO - we need the log probabilities and values from the policy
+    # that was used to collect the experiences
+    with torch.no_grad():
+        old_logproba_v, _, _, old_values_v = net(states_v)
+        # Sum log probabilities over action dimensions for continuous actions
+        old_logproba_v = old_logproba_v.sum(dim=-1)
+        old_values_v = old_values_v.squeeze(-1)
+        
+        # Compute advantages using the old value estimates
+        advantages_v = target_returns_v - old_values_v
+        
+        # Normalize advantages (standard practice for PPO/A2C)
+        # This helps with training stability and convergence
+        adv_std = max(1e-3, advantages_v.std(unbiased=False) + 1e-8)
+        advantages_v = (advantages_v - advantages_v.mean()) / adv_std
+    
+    return PPOBatch(
+        states=states_v,
+        actions=actions_v,
+        old_logprobas=old_logproba_v,
+        old_values=old_values_v,
+        target_returns=target_returns_v,
+        advantages=advantages_v
+    )
 
 
 def core_training_loop(
