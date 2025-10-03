@@ -13,6 +13,7 @@ from functools import partial
 
 from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
+from utils.common_utils import unpack_batch, unpack_batch_with_gae
 
 """This is the implementation of PPO with MountainCarContinuous-v0 RL using the PTAN wrapper libraries.
 Uses separate Actor and Critic networks with different optimizers and learning rates.
@@ -52,6 +53,7 @@ SOLVED_REWARD = 90.0
 MAX_TRAINING_FRAMES = 5e7
 MINIBATCH_SIZE = 64
 MAX_EPOCHS_PER_BATCH = 256          # Reuse each observation average of 16 times per training batch
+GAE_LAMBDA = 0.95                   # GAE lambda parameter for advantage estimation (0.9-0.99 typical)
 
 
 @dataclass
@@ -68,7 +70,7 @@ class PPOBatch:
     advantages_v: torch.Tensor
     
     def __len__(self):
-        return len(self.states)
+        return len(self.states_v)
     
     def sample_minibatch(self, minibatch_size: int):
         """Sample a random minibatch from this batch data"""
@@ -90,59 +92,12 @@ class PPOBatch:
         )
 
 
-def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
-    net: nn.Module,
-    n_steps: int
-    ):
-    """Note: Since in general an experience sub-trajectory can be n-steps,
-    the terminology used here is last state instead of next state.
-    Additionally, reward is equal to the cumulative discounted rewards from intermediate steps
-    All of this is subsumed within ptan.experience.ExperienceFirstLast
-    Modified for continuous actions - actions are now continuous values instead of discrete indices.
-    """
-    states = []
-    actions = []
-    rewards = []
-    done_masks = []
-    last_states = []
-    for exp in batch:
-        # Each observation sub-trajectory in the replay buffer is a SARS' tuple
-        states.append(exp.state)
-        actions.append(exp.action)
-        rewards.append(exp.reward)
-        # Note: torch cannot deal with None type
-        if exp.last_state is None:
-            last_states.append(exp.state)
-        else:
-            last_states.append(exp.last_state)
-        done_masks.append(exp.last_state is None)
-
-    # Array stacking during conv should work by default, but direct conversion from list of numpy array
-    # to tensor is very slow, hence the np.stack(...)
-    actions_v = torch.tensor(np.stack(actions), dtype=torch.float32)  # Continuous actions are float
-    rewards_v = torch.tensor(rewards, dtype=torch.float32)
-    states_v = torch.tensor(np.stack(states), dtype=torch.float32)
-    last_states_v = torch.tensor(np.stack(last_states), dtype=torch.float32)
-
-    # return states, actions, returns
-    with torch.no_grad():
-        _, _, _, ls_values_v = net(last_states_v)
-
-    ls_values_v = ls_values_v.squeeze(1).data
-    # Note: important step for computing returns correctly w/ loop unroll
-    ls_values_v *= GAMMA ** n_steps
-    # zero out the terminated episodes
-    done_masks_v = torch.tensor(done_masks, dtype=torch.bool)
-    ls_values_v[done_masks_v] = 0.0
-
-    returns_v = rewards_v + ls_values_v
-    return states_v, actions_v, returns_v
-
-
 def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: nn.Module) -> PPOBatch:
     """Convert raw experience batch into structured PPOBatch for PPO training.
     This computes all necessary data once per batch collection, including old policy
     log probabilities and values that are needed for PPO's surrogate loss calculation.
+    
+    PPO uses GAE vs classical TD for better advantage computation.
     
     Args:
         batch: List of experiences collected from parallel environments
@@ -151,8 +106,8 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
     Returns:
         PPOBatch containing all preprocessed data ready for multiple epochs of training
     """
-    # Unpack the raw experience batch
-    states_v, actions_v, target_returns_v = unpack_batch(batch, net, N_TD_STEPS)
+    # Unpack the raw experience batch using GAE
+    states_v, actions_v, target_returns_v, advantages_v = unpack_batch_with_gae(batch, net, N_TD_STEPS, GAMMA, GAE_LAMBDA)
     
     # Compute old policy data (before any parameter updates)
     # This is crucial for PPO - we need the log probabilities and values from the policy
@@ -231,10 +186,6 @@ def core_training_loop(
     with torch.no_grad():
         kl_divergence = (minibatch.old_logprobas_v - logproba_actions_v).mean().item()
     
-
-
-
-
     # Entropy bonus for continuous actions
     # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
     entropy_v = 0.5 * (actions_logvar_v + math.log(2 * math.pi * math.e))
@@ -389,6 +340,7 @@ if __name__ == "__main__":
         'actor_lr_end': ACTOR_LR_END,
         'lr_decay_frames': LR_DECAY_FRAMES,
         'gamma': GAMMA,
+        'gae_lambda': GAE_LAMBDA,
         'entropy_beta_start': ENTROPY_BONUS_BETA_START,
         'entropy_beta_end': ENTROPY_BONUS_BETA_END,
         'entropy_decay_frames': ENTROPY_DECAY_FRAMES,
@@ -401,7 +353,6 @@ if __name__ == "__main__":
     exp_iterator = iter(exp_source)
     frame_idx = 0  # Track total frames of experience trained on
     while not solved and iter_no <= MAX_TRAINING_FRAMES:
-        num_epochs_per_batch = 0
         iter_no += 1.0
         iter_start_time = time.time()
 
@@ -410,60 +361,82 @@ if __name__ == "__main__":
             exp = next(exp_iterator)
             batch.append(exp)
 
-        # TODO: Perform multiple epochs of training per batch
-        while True:
-            # TODO: generate minibatches from batch
-            # Training step with separate optimizers
+        # Prepare structured batch data for PPO training
+        ppo_batch = prepare_ppo_batch(batch, net)
+        
+        # Perform multiple epochs of training per batch
+        num_epochs_per_batch = 0
+        # Initialize with fallback values to ensure loss_dict is never None
+        loss_dict = {
+            'total_loss': 0.0, 'critic_loss': 0.0, 'actor_loss': 0.0, 'pg_loss': 0.0,
+            'entropy_raw': 0.0, 'entropy_loss': 0.0, 'var_penalty': 0.0, 'action_reg': 0.0,
+            'current_entropy_beta': 0.0, 'kl_divergence': 0.0, 'mean_ratio': 1.0, 'ratio_clipped_fraction': 0.0
+        }
+        
+        for epoch in range(MAX_EPOCHS_PER_BATCH):
+            # Sample a random minibatch from the structured batch data
+            minibatch = ppo_batch.sample_minibatch(MINIBATCH_SIZE)
+            
+            # Training step with PPO minibatch - overwrites loss_dict
             loss_dict = core_training_loop(
-                net, batch, actor_optimizer, critic_optimizer,
+                net, minibatch, actor_optimizer, critic_optimizer,
                 actor_scheduler, critic_scheduler, frame_idx, iter_no
             )
-            batch.clear()
-            frame_idx += MINIBATCH_SIZE
+            
+            num_epochs_per_batch += 1
+            frame_idx += len(minibatch)
+            
+            # Early stopping if policy change is too large (optional)
+            if 'kl_divergence' in loss_dict and loss_dict['kl_divergence'] > 0.02:
+                print(f"Early stopping at epoch {epoch} due to high KL divergence: {loss_dict['kl_divergence']:.4f}")
+                break
 
-            training_time = time.time() - iter_start_time
+        batch.clear()  # Clear batch after multiple epochs of training
 
-            # Print periodic performance summary every 10000 iterations
-            if iter_no % 10000 == 0:
-                perf_tracker.print_checkpoint(int(iter_no), frame_idx)
+        training_time = time.time() - iter_start_time
 
-            # Test trials to check success condition
-            eval_start_time = time.time()
-            average_return = play_trials(test_env, net)
-            eval_time = time.time() - eval_start_time
+        # Print periodic performance summary every 10000 iterations
+        if iter_no % 10000 == 0:
+            perf_tracker.print_checkpoint(int(iter_no), frame_idx)
 
-            max_return = average_return if (max_return < average_return) else max_return
-            trial += 1
+        # Test trials to check success condition
+        eval_start_time = time.time()
+        average_return = play_trials(test_env, net)
+        eval_time = time.time() - eval_start_time
 
-            # Log performance metrics
-            perf_metrics = perf_tracker.log_iteration(
-                int(iter_no), frame_idx, average_return, training_time, eval_time, loss_dict
+        max_return = average_return if (max_return < average_return) else max_return
+        trial += 1
+
+        # Log performance metrics - loss_dict is now guaranteed to be defined
+        perf_metrics = perf_tracker.log_iteration(
+            int(iter_no), frame_idx, average_return, training_time, eval_time, loss_dict
+        )
+
+        if iter_no % 100 == 0:
+            # Enhanced logging with timing information and separate learning rates
+            critic_lr = critic_optimizer.param_groups[0]["lr"]
+            actor_lr = actor_optimizer.param_groups[0]["lr"]
+            print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
+                f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
+                f"critic_lr={critic_lr:.5e}, actor_lr={actor_lr:.5e}, "
+                f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
+                f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m | "
+                f"losses: total={loss_dict['total_loss']:.4f}, "
+                f"critic={loss_dict['critic_loss']:.4f}, "
+                f"actor={loss_dict['actor_loss']:.4f}, "
+                f"pg_loss={loss_dict['pg_loss']:.4f}, "
+                f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
+                f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
+                f"var_penalty={loss_dict['var_penalty']:.4e}, "
+                f"action_reg={loss_dict['action_reg']:.4e}, "
+                f"kl_div={loss_dict['kl_divergence']:.4f}, "
+                f"mean_ratio={loss_dict['mean_ratio']:.3f}, "
+                f"clipped_frac={loss_dict['ratio_clipped_fraction']:.3f}, "
+                f"entropy_β={loss_dict['current_entropy_beta']:.4e}"
             )
 
-            if iter_no % 100 == 0:
-                # Enhanced logging with timing information and separate learning rates
-                critic_lr = critic_optimizer.param_groups[0]["lr"]
-                actor_lr = actor_optimizer.param_groups[0]["lr"]
-                print(f"(iter: {iter_no:6.0f}, trial: {trial:4d}) - "
-                    f"avg_return={average_return:7.2f}, max_return={max_return:7.2f} | "
-                    f"critic_lr={critic_lr:.5e}, actor_lr={actor_lr:.5e}, "
-                    f"train_time={training_time:.3f}s, eval_time={eval_time:.3f}s, "
-                    f"fps={perf_metrics['current_fps']:.1f}, total_time={perf_metrics['total_elapsed']/60:.1f}m | "
-                    f"losses: total={loss_dict['total_loss']:.4f}, "
-                    f"critic={loss_dict['critic_loss']:.4f}, "
-                    f"actor={loss_dict['actor_loss']:.4f}, "
-                    f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
-                    f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
-                    f"var_penalty={loss_dict['var_penalty']:.4e}, "
-                    f"action_reg={loss_dict['action_reg']:.4e}, "
-                    f"entropy_β={loss_dict['current_entropy_beta']:.4e}"
-                )
-
-            # Check for training termination
-            num_epochs_per_batch += 1
-            solved = average_return > SOLVED_REWARD  # MountainCarContinuous is solved when avg reward > 90
-            if solved or num_epochs_per_batch >= MAX_EPOCHS_PER_BATCH:
-                break
+        # Check for training termination
+        solved = average_return > SOLVED_REWARD  # MountainCarContinuous is solved when avg reward > 90
 
 
     # Training completed - print comprehensive summary using utility function
