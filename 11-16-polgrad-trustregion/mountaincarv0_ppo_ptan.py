@@ -30,12 +30,12 @@ ACTOR_HIDDEN1_DIM = 128
 ACTOR_HIDDEN2_DIM = 64
 
 N_TD_STEPS = 1 # Number of steps aggregated per experience (n in n-step TD)
-N_ROLLOUT_STEPS = 128 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS
+N_ROLLOUT_STEPS = 128 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS = 2048
 
-GAMMA = 0.99  # Slightly lower for MountainCarContinuous's shorter episodes
-# Separate learning rates for actor and critic
-CRITIC_LR_START = 7e-4
-CRITIC_LR_END = 1e-4
+GAMMA = 0.99  # Good for MountainCarContinuous episodes (~200 steps)
+# Balanced learning rates for PPO - critic and actor should be similar
+CRITIC_LR_START = 3e-4  # Reduced from 7e-4 for better stability
+CRITIC_LR_END = 5e-5    # Proportionally reduced
 ACTOR_LR_START = 3e-4
 ACTOR_LR_END = 5e-5
 LR_DECAY_FRAMES = 5e7
@@ -43,17 +43,18 @@ LR_DECAY_FRAMES = 5e7
 # PG related - adjusted for continuous actions
 ENTROPY_BONUS_BETA_START = 3e-3  # Higher initial exploration
 ENTROPY_BONUS_BETA_END = 1e-5    # Lower final exploration
-ENTROPY_DECAY_FRAMES = 1e6       # Decay over 1M frames
+ENTROPY_DECAY_FRAMES = 1e7       # Extended from 1e6 to 1e7 for longer exploration period
 CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 
 # MountainCarContinuous success threshold (one time +100 bonus for climbing the hill w/ small energy penalty otherwise)
 SOLVED_REWARD = 90.0  
 
-# PPO specific hyperparameters
+# PPO specific hyperparameters - OPTIMIZED FOR EFFICIENCY
 MAX_TRAINING_FRAMES = 5e7
-MINIBATCH_SIZE = 64
-MAX_EPOCHS_PER_BATCH = 256          # Reuse each observation average of 16 times per training batch
+MINIBATCH_SIZE = 256                # Increased from 64 for better efficiency (8 minibatches instead of 32)
+MAX_EPOCHS_PER_BATCH = 4            # REDUCED from 256 to 4 - standard PPO range
 GAE_LAMBDA = 0.95                   # GAE lambda parameter for advantage estimation (0.9-0.99 typical)
+PPO_CLIP_EPSILON = 0.2              # PPO clipping parameter - now parameterized instead of hardcoded
 
 
 @dataclass
@@ -145,7 +146,7 @@ def core_training_loop(
     critic_scheduler,
     frame_idx: int,
     iter_no=None,
-    clip_epsilon=0.2,
+    clip_epsilon=PPO_CLIP_EPSILON,  # Now uses the hyperparameter instead of hardcoded value
     debug=True
     ):
     """PPO training step using structured minibatch data.
@@ -309,7 +310,7 @@ if __name__ == "__main__":
     average_return = -100.0  # Initialize to handle potential unbound variable
 
     # Separate optimizers for actor and critic
-    # A2C reports more stable results w/ RMSProp for critic, Adam for actor
+    # PPO typically uses Adam for both actor and critic with balanced learning rates
     critic_optimizer = optim.Adam(net.get_critic_parameters(), lr=CRITIC_LR_START, eps=1e-5)
     actor_optimizer = optim.Adam(net.get_actor_parameters(), lr=ACTOR_LR_START, eps=1e-5)
 
@@ -334,6 +335,9 @@ if __name__ == "__main__":
         'n_td_steps': N_TD_STEPS,
         'n_rollout_steps': N_ROLLOUT_STEPS,
         'batch_size': N_ENVS * N_ROLLOUT_STEPS,
+        'minibatch_size': MINIBATCH_SIZE,
+        'max_epochs_per_batch': MAX_EPOCHS_PER_BATCH,
+        'ppo_clip_epsilon': PPO_CLIP_EPSILON,
         'critic_lr_start': CRITIC_LR_START,
         'critic_lr_end': CRITIC_LR_END,
         'actor_lr_start': ACTOR_LR_START,
@@ -364,7 +368,7 @@ if __name__ == "__main__":
         # Prepare structured batch data for PPO training
         ppo_batch = prepare_ppo_batch(batch, net)
         
-        # Perform multiple epochs of training per batch
+        # Perform multiple epochs of training per batch (now much more reasonable: 4 epochs instead of 256)
         num_epochs_per_batch = 0
         # Initialize with fallback values to ensure loss_dict is never None
         loss_dict = {
@@ -374,7 +378,7 @@ if __name__ == "__main__":
         }
         
         for epoch in range(MAX_EPOCHS_PER_BATCH):
-            # Sample a random minibatch from the structured batch data
+            # Sample a random minibatch from the structured batch data (now 256 instead of 64)
             minibatch = ppo_batch.sample_minibatch(MINIBATCH_SIZE)
             
             # Training step with PPO minibatch - overwrites loss_dict
