@@ -60,12 +60,12 @@ class PPOBatch:
     Note: Unlike other algorithms, PPO needs to keep track of old log probabilities and values for 
     the surrogate loss calculation. Computing and storing once per batch is much more efficient than
     recomputing for every minibatch since the data is reused for multiple epochs."""
-    states: torch.Tensor
-    actions: torch.Tensor
-    old_logprobas: torch.Tensor
-    old_values: torch.Tensor
-    target_returns: torch.Tensor
-    advantages: torch.Tensor
+    states_v: torch.Tensor
+    actions_v: torch.Tensor
+    old_logprobas_v: torch.Tensor
+    old_values_v: torch.Tensor
+    target_returns_v: torch.Tensor
+    advantages_v: torch.Tensor
     
     def __len__(self):
         return len(self.states)
@@ -81,12 +81,12 @@ class PPOBatch:
             indices = torch.randperm(batch_size)[:minibatch_size]
         
         return PPOBatch(
-            states=self.states[indices],
-            actions=self.actions[indices],
-            old_logprobas=self.old_logprobas[indices],
-            old_values=self.old_values[indices],
-            target_returns=self.target_returns[indices],
-            advantages=self.advantages[indices]
+            states_v=self.states_v[indices],
+            actions_v=self.actions_v[indices],
+            old_logprobas_v=self.old_logprobas_v[indices],
+            old_values_v=self.old_values_v[indices],
+            target_returns_v=self.target_returns_v[indices],
+            advantages_v=self.advantages_v[indices]
         )
 
 
@@ -172,55 +172,68 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
         advantages_v = (advantages_v - advantages_v.mean()) / adv_std
     
     return PPOBatch(
-        states=states_v,
-        actions=actions_v,
-        old_logprobas=old_logproba_v,
-        old_values=old_values_v,
-        target_returns=target_returns_v,
-        advantages=advantages_v
+        states_v=states_v,
+        actions_v=actions_v,
+        old_logprobas_v=old_logproba_v,
+        old_values_v=old_values_v,
+        target_returns_v=target_returns_v,
+        advantages_v=advantages_v
     )
 
 
 def core_training_loop(
     net: nn.Module,
-    batch: list,
+    minibatch: PPOBatch,
     actor_optimizer,
     critic_optimizer,
     actor_scheduler,
     critic_scheduler,
     frame_idx: int,
     iter_no=None,
-    reward_norm=True,
+    clip_epsilon=0.2,
     debug=True
     ):
-    """In A2C, the entire generated batch of episodes is used for training in every epoch.
-    Modified for continuous actions using Gaussian policy with log variance parameterization.
+    """PPO training step using structured minibatch data.
+    Key differences from A2C:
+    1. Uses clipped surrogate loss instead of standard policy gradient
+    2. Uses pre-computed old log probabilities for importance sampling ratio
+    3. Uses pre-computed advantages from PPOBatch
     Returns: Dictionary containing loss components for tracking
     """
     actor_optimizer.zero_grad()
     critic_optimizer.zero_grad()
 
-    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
-    logproba_actions_v, actions_mu_v, actions_logvar_v, values_v = net(states_v)
+    # Get current policy outputs for the minibatch
+    logproba_actions_v, actions_mu_v, actions_logvar_v, values_v = net(minibatch.states_v)
+    
+    # Sum log probabilities over action dimensions for continuous actions
+    logproba_actions_v = logproba_actions_v.sum(dim=-1)
+    values_v = values_v.squeeze(-1)
 
     # Compute current entropy bonus with decay
     entropy_progress = min(1.0, frame_idx / ENTROPY_DECAY_FRAMES)
     current_entropy_beta = ENTROPY_BONUS_BETA_START * (1 - entropy_progress) + ENTROPY_BONUS_BETA_END * entropy_progress
 
-    # Critic loss - same as discrete case
-    critic_loss_v = nn.functional.mse_loss(values_v.squeeze(-1), target_return_v)
+    # Critic loss - same as A2C
+    critic_loss_v = nn.functional.mse_loss(values_v, minibatch.target_returns_v)
 
-    # Compute advantages
-    adv_v = target_return_v - values_v.squeeze(-1).detach()
-    # Normalize advantages (Standard for PPO, A2C etc)
-    adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
-    adv_v = (adv_v - adv_v.mean()) / adv_std
+    # Compute importance sampling ratio
+    ratio = torch.exp(logproba_actions_v - minibatch.old_logprobas_v)
+    
+    # PPO clipped surrogate loss
+    surr1 = ratio * minibatch.advantages_v
+    surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * minibatch.advantages_v
+    
+    # Policy loss is negative of minimum (we want to maximize)
+    pg_loss_v = -torch.min(surr1, surr2).mean()
+    
+    # Optional: Compute KL divergence for early stopping
+    with torch.no_grad():
+        kl_divergence = (minibatch.old_logprobas_v - logproba_actions_v).mean().item()
+    
 
-    # Compute log probabilities for continuous actions
-    logproba_actions_v = logproba_actions_v.sum(dim=-1)  # Sum over action dimensions
 
-    # Policy gradient loss
-    pg_loss_v = -(adv_v * logproba_actions_v).mean()
+
 
     # Entropy bonus for continuous actions
     # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
@@ -256,18 +269,25 @@ def core_training_loop(
         with torch.no_grad():
             mean_action = actions_mu_v.mean(dim=0).cpu().numpy()
             std_action = torch.exp(actions_logvar_v / 2).mean(dim=0).cpu().numpy()
-            print(f"Action μ={mean_action[0]:.3f}, σ={std_action[0]:.3f}, entropy_β={current_entropy_beta:.4e}")
+            mean_ratio = ratio.mean().item()
+            print(f"Action μ={mean_action[0]:.3f}, σ={std_action[0]:.3f}, "
+                  f"ratio={mean_ratio:.3f}, kl={kl_divergence:.4f}, "
+                  f"entropy_β={current_entropy_beta:.4e}")
 
     # Return loss components for tracking
     return {
         'total_loss': total_loss_v.item(),
         'critic_loss': critic_loss_v.item(),
         'actor_loss': actor_loss_v.item(),
+        'pg_loss': pg_loss_v.item(),
         'entropy_raw': entropy_v.item(),
         'entropy_loss': entropy_bonus_v.item(),
         'var_penalty': var_penalty_v.item(),
         'action_reg': action_reg_v.item(),
-        'current_entropy_beta': current_entropy_beta
+        'current_entropy_beta': current_entropy_beta,
+        'kl_divergence': kl_divergence,
+        'mean_ratio': ratio.mean().item(),
+        'ratio_clipped_fraction': ((ratio < 1.0 - clip_epsilon) | (ratio > 1.0 + clip_epsilon)).float().mean().item()
     }
 
 
