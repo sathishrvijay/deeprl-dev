@@ -125,9 +125,13 @@ class ContinuousA2CActor(nn.Module):
         self.mean_head = nn.Linear(hidden2_dim, action_dim)
         self.log_var_head = nn.Linear(hidden2_dim, action_dim)
 
+        # initialize the mean head to 0
+        nn.init.constant_(self.mean_head.bias, 0.0)
+        nn.init.xavier_uniform_(self.mean_head.weight, gain=0.01)
+
         # Initialize log_var to reasonable values for stable exploration
         # Start with std ≈ 0.3 for conservative initial exploration
-        nn.init.constant_(self.log_var_head.bias, -2.2)  # log(0.11) ≈ -2.2, std ≈ 0.33
+        nn.init.constant_(self.log_var_head.bias, -1.022)  # log(0.11) ≈ -2.2, std ≈ 0.6 -> variance ≈ 0.36 -> log(0.36) ≈ -1.022
         nn.init.xavier_uniform_(self.log_var_head.weight, gain=0.01)  # Small initial weights
 
     def forward(self, x: torch.Tensor):
