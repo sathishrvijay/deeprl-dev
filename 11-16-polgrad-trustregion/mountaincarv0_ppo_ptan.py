@@ -7,6 +7,7 @@ import numpy as np
 import time
 import math
 from dataclasses import dataclass
+import pdb
 
 import typing as tt
 from functools import partial
@@ -16,7 +17,11 @@ from utils import PerformanceTracker, print_training_header, print_final_summary
 from utils.common_utils import unpack_batch, unpack_batch_with_gae
 
 """This is the implementation of PPO with MountainCarContinuous-v0 RL using the PTAN wrapper libraries.
-Uses separate Actor and Critic networks with different optimizers and learning rates.
+PPO implementation can use the exact same Actor and Critic networks and Agent as Continuous A2C. Only changes are:
+- uses GAE advantage computation instead of simple TD
+- uses multiple epochs of training per generated batch
+- uses surrogate loss instead of policy gradient
+Note: During training, adjust the learning rates for actor and critic so that advantage ratios are close to 1.0.
 """
 
 # HPARAMS
@@ -34,10 +39,10 @@ N_ROLLOUT_STEPS = 128 # formal rollout definition; batch_size = N_ENVS * N_ROLLO
 
 GAMMA = 0.99  # Good for MountainCarContinuous episodes (~200 steps)
 # Balanced learning rates for PPO - critic and actor should be similar
-CRITIC_LR_START = 3e-4  # Reduced from 7e-4 for better stability
-CRITIC_LR_END = 5e-5    # Proportionally reduced
-ACTOR_LR_START = 3e-4
-ACTOR_LR_END = 5e-5
+CRITIC_LR_START = 1e-6  # Reduced from 7e-4 for better stability
+CRITIC_LR_END = 5e-7    # Proportionally reduced
+ACTOR_LR_START = 3e-6
+ACTOR_LR_END = 7e-7
 LR_DECAY_FRAMES = 5e7
 
 # PG related - adjusted for continuous actions
@@ -115,8 +120,6 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
     # that was used to collect the experiences
     with torch.no_grad():
         old_logproba_v, _, _, old_values_v = net(states_v)
-        # Sum log probabilities over action dimensions for continuous actions
-        old_logproba_v = old_logproba_v.sum(dim=-1)
         old_values_v = old_values_v.squeeze(-1)
         
         # Compute advantages using the old value estimates
@@ -161,9 +164,6 @@ def core_training_loop(
 
     # Get current policy outputs for the minibatch
     logproba_actions_v, actions_mu_v, actions_logvar_v, values_v = net(minibatch.states_v)
-    
-    # Sum log probabilities over action dimensions for continuous actions
-    logproba_actions_v = logproba_actions_v.sum(dim=-1)
     values_v = values_v.squeeze(-1)
 
     # Compute current entropy bonus with decay
@@ -173,12 +173,12 @@ def core_training_loop(
     # Critic loss - same as A2C
     critic_loss_v = nn.functional.mse_loss(values_v, minibatch.target_returns_v)
 
-    # Compute importance sampling ratio
-    ratio = torch.exp(logproba_actions_v - minibatch.old_logprobas_v)
+    # Compute importance sampling ratio (per minibatch observation)
+    ratios = torch.exp(logproba_actions_v - minibatch.old_logprobas_v)
     
     # PPO clipped surrogate loss
-    surr1 = ratio * minibatch.advantages_v
-    surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * minibatch.advantages_v
+    surr1 = ratios * minibatch.advantages_v
+    surr2 = torch.clamp(ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * minibatch.advantages_v
     
     # Policy loss is negative of minimum (we want to maximize)
     pg_loss_v = -torch.min(surr1, surr2).mean()
@@ -221,7 +221,7 @@ def core_training_loop(
         with torch.no_grad():
             mean_action = actions_mu_v.mean(dim=0).cpu().numpy()
             std_action = torch.exp(actions_logvar_v / 2).mean(dim=0).cpu().numpy()
-            mean_ratio = ratio.mean().item()
+            mean_ratio = ratios.mean().item()
             print(f"Action μ={mean_action[0]:.3f}, σ={std_action[0]:.3f}, "
                   f"ratio={mean_ratio:.3f}, kl={kl_divergence:.4f}, "
                   f"entropy_β={current_entropy_beta:.4e}")
@@ -238,8 +238,8 @@ def core_training_loop(
         'action_reg': action_reg_v.item(),
         'current_entropy_beta': current_entropy_beta,
         'kl_divergence': kl_divergence,
-        'mean_ratio': ratio.mean().item(),
-        'ratio_clipped_fraction': ((ratio < 1.0 - clip_epsilon) | (ratio > 1.0 + clip_epsilon)).float().mean().item()
+        'mean_ratio': ratios.mean().item(),
+        'ratio_clipped_fraction': ((ratios < 1.0 - clip_epsilon) | (ratios > 1.0 + clip_epsilon)).float().mean().item()
     }
 
 
@@ -390,9 +390,10 @@ if __name__ == "__main__":
             num_epochs_per_batch += 1
             frame_idx += len(minibatch)
             
-            # Early stopping if policy change is too large (optional)
-            if 'kl_divergence' in loss_dict and loss_dict['kl_divergence'] > 0.02:
-                print(f"Early stopping at epoch {epoch} due to high KL divergence: {loss_dict['kl_divergence']:.4f}")
+            # Early stopping for epoch if policy change is too large (optional) to improve training stability
+            # Only stop if KL is VERY high and we've done at least 2 epochs
+            if epoch >= 2 and 'kl_divergence' in loss_dict and loss_dict['kl_divergence'] > 0.05:
+                print(f"iter: {iter_no} - Early stopping at epoch {epoch} due to high KL divergence: {loss_dict['kl_divergence']:.4f}")
                 break
 
         batch.clear()  # Clear batch after multiple epochs of training
