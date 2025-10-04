@@ -12,6 +12,7 @@ from functools import partial
 
 from models import agents, pgtr_models
 from utils import PerformanceTracker, print_training_header, print_final_summary
+from utils.common_utils import unpack_batch
 
 """This is the implementation of A2C with MountainCarContinuous-v0 RL using the PTAN wrapper libraries.
 A2C serves as a performant baseline for Policy Gradient methods and a precursor to more advanced
@@ -51,55 +52,6 @@ CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
 SOLVED_REWARD = 90.0  
 
 
-def unpack_batch(batch: tt.List[ptan.experience.ExperienceFirstLast],
-    net: nn.Module,
-    n_steps: int
-    ):
-    """Note: Since in general an experience sub-trajectory can be n-steps,
-    the terminology used here is last state instead of next state.
-    Additionally, reward is equal to the cumulative discounted rewards from intermediate steps
-    All of this is subsumed within ptan.experience.ExperienceFirstLast
-    Modified for continuous actions - actions are now continuous values instead of discrete indices.
-    """
-    states = []
-    actions = []
-    rewards = []
-    done_masks = []
-    last_states = []
-    for exp in batch:
-        # Each observation sub-trajectory in the replay buffer is a SARS' tuple
-        states.append(exp.state)
-        actions.append(exp.action)
-        rewards.append(exp.reward)
-        # Note: torch cannot deal with None type
-        if exp.last_state is None:
-            last_states.append(exp.state)
-        else:
-            last_states.append(exp.last_state)
-        done_masks.append(exp.last_state is None)
-
-    # Array stacking during conv should work by default, but direct conversion from list of numpy array
-    # to tensor is very slow, hence the np.stack(...)
-    actions_v = torch.tensor(np.stack(actions), dtype=torch.float32)  # Continuous actions are float
-    rewards_v = torch.tensor(rewards, dtype=torch.float32)
-    states_v = torch.tensor(np.stack(states), dtype=torch.float32)
-    last_states_v = torch.tensor(np.stack(last_states), dtype=torch.float32)
-
-    # return states, actions, returns
-    with torch.no_grad():
-        _, _, _, ls_values_v = net(last_states_v)
-
-    ls_values_v = ls_values_v.squeeze(1).data
-    # Note: important step for computing returns correctly w/ loop unroll
-    ls_values_v *= GAMMA ** n_steps
-    # zero out the terminated episodes
-    done_masks_v = torch.tensor(done_masks, dtype=torch.bool)
-    ls_values_v[done_masks_v] = 0.0
-
-    returns_v = rewards_v + ls_values_v
-    return states_v, actions_v, returns_v
-
-
 def core_training_loop(
     net: nn.Module,
     batch: list,
@@ -119,7 +71,7 @@ def core_training_loop(
     actor_optimizer.zero_grad()
     critic_optimizer.zero_grad()
 
-    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS)
+    states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS, GAMMA)
     logproba_actions_v, actions_mu_v, actions_logvar_v, values_v = net(states_v)
 
     # Compute current entropy bonus with decay
