@@ -112,8 +112,10 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
     Returns:
         PPOBatch containing all preprocessed data ready for multiple epochs of training
     """
-    # Unpack the raw experience batch using GAE
-    states_v, actions_v, target_returns_v, advantages_v = unpack_batch_with_gae(batch, net, N_TD_STEPS, GAMMA, GAE_LAMBDA)
+    # Unpack the raw experience batch using GAE with parallel environment support
+    states_v, actions_v, target_returns_v, advantages_v = unpack_batch_with_gae(
+        batch, net, N_TD_STEPS, GAMMA, GAE_LAMBDA, n_envs=N_ENVS
+    )
     
     # Compute old policy data (before any parameter updates)
     # This is crucial for PPO - we need the log probabilities and values from the policy
@@ -122,10 +124,7 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
         old_logproba_v, _, _, old_values_v = net(states_v)
         old_values_v = old_values_v.squeeze(-1)
         
-        # Use GAE advantages directly - they're already properly calculated with GAE
-        # No need to recompute with simple TD method (returns - values)
-        
-        # Normalize advantages (standard practice for PPO/A2C)
+        # Normalize GAE advantages (standard practice for PPO/A2C)
         # This helps with training stability and convergence
         adv_std = max(1e-3, (advantages_v.std(unbiased=False) + 1e-8).item())
         advantages_v = (advantages_v - advantages_v.mean()) / adv_std
