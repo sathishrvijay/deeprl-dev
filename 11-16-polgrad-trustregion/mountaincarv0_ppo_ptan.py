@@ -60,6 +60,7 @@ MINIBATCH_SIZE = 256                # Increased from 64 for better efficiency (8
 MAX_EPOCHS_PER_BATCH = 4            # REDUCED from 256 to 4 - standard PPO range
 GAE_LAMBDA = 0.95                   # GAE lambda parameter for advantage estimation (0.9-0.99 typical)
 PPO_CLIP_EPSILON = 0.2              # PPO clipping parameter - now parameterized instead of hardcoded
+PPO_TARGET_KL = 0.015               # Target KL divergence for early stopping (standard: 0.01-0.02)
 
 
 @dataclass
@@ -182,9 +183,20 @@ def core_training_loop(
     # Policy loss is negative of minimum (we want to maximize)
     pg_loss_v = -torch.min(surr1, surr2).mean()
     
-    # Optional: Compute KL divergence for early stopping
+    # Compute true KL divergence for diagonal Gaussian policies (for early stopping)
+    # We need to get the old policy's distribution parameters to compute true KL
     with torch.no_grad():
-        kl_divergence = (minibatch.old_logprobas_v - logproba_actions_v).mean().item()
+        old_mu_v, old_logvar_v = net.get_action_distribution(minibatch.states_v)
+        
+        # KL divergence between two diagonal Gaussians:
+        # KL(old || new) = 0.5 * sum_i [ (σ²_old / σ²_new) + (μ_new - μ_old)² / σ²_new - 1 + log(σ²_new / σ²_old) ]
+        # With log variance: σ² = exp(log_var)
+        kl_per_dim = 0.5 * (
+            torch.exp(old_logvar_v - actions_logvar_v) +  # σ²_old / σ²_new
+            (actions_mu_v - old_mu_v).pow(2) / torch.exp(actions_logvar_v) +  # (μ_new - μ_old)² / σ²_new
+            actions_logvar_v - old_logvar_v - 1.0  # log(σ²_new / σ²_old) - 1
+        )
+        kl_divergence = kl_per_dim.sum(dim=-1).mean().item()  # Sum over action dims, mean over batch 
     
     # Entropy bonus for continuous actions
     # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
@@ -337,6 +349,7 @@ if __name__ == "__main__":
         'minibatch_size': MINIBATCH_SIZE,
         'max_epochs_per_batch': MAX_EPOCHS_PER_BATCH,
         'ppo_clip_epsilon': PPO_CLIP_EPSILON,
+        'ppo_target_kl': PPO_TARGET_KL,
         'critic_lr_start': CRITIC_LR_START,
         'critic_lr_end': CRITIC_LR_END,
         'actor_lr_start': ACTOR_LR_START,
@@ -389,10 +402,10 @@ if __name__ == "__main__":
             num_epochs_per_batch += 1
             frame_idx += len(minibatch)
             
-            # Early stopping for epoch if policy change is too large (optional) to improve training stability
-            # Only stop if KL is VERY high and we've done at least 2 epochs
-            if epoch >= 2 and 'kl_divergence' in loss_dict and loss_dict['kl_divergence'] > 0.05:
-                print(f"iter: {iter_no} - Early stopping at epoch {epoch} due to high KL divergence: {loss_dict['kl_divergence']:.4f}")
+            # Early stopping if KL divergence exceeds target (prevents policy from changing too much)
+            # Standard PPO practice: stop if KL > target_kl after at least 1 epoch
+            if epoch >= 1 and 'kl_divergence' in loss_dict and loss_dict['kl_divergence'] > PPO_TARGET_KL:
+                print(f"iter: {iter_no} - Early stopping at epoch {epoch} due to KL divergence {loss_dict['kl_divergence']:.4f} > target {PPO_TARGET_KL}")
                 break
 
         batch.clear()  # Clear batch after multiple epochs of training
