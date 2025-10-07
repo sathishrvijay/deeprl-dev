@@ -72,7 +72,8 @@ def core_training_loop(
     critic_optimizer.zero_grad()
 
     states_v, actions_v, target_return_v = unpack_batch(batch, net, N_TD_STEPS, GAMMA)
-    logproba_actions_v, actions_mu_v, actions_logvar_v, values_v = net(states_v)
+    # Get current policy distribution parameters and values
+    _, actions_mu_v, actions_logvar_v, values_v = net(states_v)
 
     # Compute current entropy bonus with decay
     entropy_progress = min(1.0, frame_idx / ENTROPY_DECAY_FRAMES)
@@ -87,8 +88,8 @@ def core_training_loop(
     adv_std = max(1e-3, adv_v.std(unbiased=False) + 1e-8)
     adv_v = (adv_v - adv_v.mean()) / adv_std
 
-    # Compute log probabilities for continuous actions
-    logproba_actions_v = logproba_actions_v.sum(dim=-1)  # Sum over action dimensions
+    # NOTE: Compute log π(a|s) for taken (squashed) actions from the batch using the unified helper (vs from a sample for correctness)
+    logproba_actions_v = net.compute_logproba(actions_v, actions_mu_v, actions_logvar_v, squashed=True)
 
     # Policy gradient loss
     pg_loss_v = -(adv_v * logproba_actions_v).mean()
