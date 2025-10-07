@@ -68,10 +68,15 @@ class PPOBatch:
     """Container for all batch data needed for PPO training. 
     Note: Unlike other algorithms, PPO needs to keep track of old log probabilities and values for 
     the surrogate loss calculation. Computing and storing once per batch is much more efficient than
-    recomputing for every minibatch since the data is reused for multiple epochs."""
+    recomputing for every minibatch since the data is reused for multiple epochs.
+    
+    For proper KL divergence computation, we also store the old policy distribution parameters (mu, logvar)
+    which are captured before any network updates."""
     states_v: torch.Tensor
     actions_v: torch.Tensor
     old_logprobas_v: torch.Tensor
+    old_mu_v: torch.Tensor
+    old_logvar_v: torch.Tensor
     old_values_v: torch.Tensor
     target_returns_v: torch.Tensor
     advantages_v: torch.Tensor
@@ -93,6 +98,8 @@ class PPOBatch:
             states_v=self.states_v[indices],
             actions_v=self.actions_v[indices],
             old_logprobas_v=self.old_logprobas_v[indices],
+            old_mu_v=self.old_mu_v[indices],
+            old_logvar_v=self.old_logvar_v[indices],
             old_values_v=self.old_values_v[indices],
             target_returns_v=self.target_returns_v[indices],
             advantages_v=self.advantages_v[indices]
@@ -119,10 +126,10 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
     )
     
     # Compute old policy data (before any parameter updates)
-    # This is crucial for PPO - we need the log probabilities and values from the policy
-    # that was used to collect the experiences
+    # This is crucial for PPO - we need the log probabilities, distribution parameters (mu, logvar),
+    # and values from the policy that was used to collect the experiences
     with torch.no_grad():
-        old_logproba_v, _, _, old_values_v = net(states_v)
+        old_logproba_v, old_mu_v, old_logvar_v, old_values_v = net(states_v)
         old_values_v = old_values_v.squeeze(-1)
         
         # Normalize GAE advantages (standard practice for PPO/A2C)
@@ -134,6 +141,8 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
         states_v=states_v,
         actions_v=actions_v,
         old_logprobas_v=old_logproba_v,
+        old_mu_v=old_mu_v,
+        old_logvar_v=old_logvar_v,
         old_values_v=old_values_v,
         target_returns_v=target_returns_v,
         advantages_v=advantages_v
@@ -184,19 +193,17 @@ def core_training_loop(
     pg_loss_v = -torch.min(surr1, surr2).mean()
     
     # Compute true KL divergence for diagonal Gaussian policies (for early stopping)
-    # We need to get the old policy's distribution parameters to compute true KL
+    # Use the stored old policy distribution parameters from PPOBatch (captured before any network updates)
     with torch.no_grad():
-        old_mu_v, old_logvar_v = net.get_action_distribution(minibatch.states_v)
-        
         # KL divergence between two diagonal Gaussians:
         # KL(old || new) = 0.5 * sum_i [ (σ²_old / σ²_new) + (μ_new - μ_old)² / σ²_new - 1 + log(σ²_new / σ²_old) ]
         # With log variance: σ² = exp(log_var)
         kl_per_dim = 0.5 * (
-            torch.exp(old_logvar_v - actions_logvar_v) +  # σ²_old / σ²_new
-            (actions_mu_v - old_mu_v).pow(2) / torch.exp(actions_logvar_v) +  # (μ_new - μ_old)² / σ²_new
-            actions_logvar_v - old_logvar_v - 1.0  # log(σ²_new / σ²_old) - 1
+            torch.exp(minibatch.old_logvar_v - actions_logvar_v) +  # σ²_old / σ²_new
+            (actions_mu_v - minibatch.old_mu_v).pow(2) / torch.exp(actions_logvar_v) +  # (μ_new - μ_old)² / σ²_new
+            actions_logvar_v - minibatch.old_logvar_v - 1.0  # log(σ²_new / σ²_old) - 1
         )
-        kl_divergence = kl_per_dim.sum(dim=-1).mean().item()  # Sum over action dims, mean over batch 
+        kl_divergence = kl_per_dim.sum(dim=-1).mean().item()  # Sum over action dims, mean over batch
     
     # Entropy bonus for continuous actions
     # Gaussian entropy: 0.5 * log(2πe * σ²) = 0.5 * (log(2πe) + log_var)
