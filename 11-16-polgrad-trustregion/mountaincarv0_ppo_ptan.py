@@ -34,7 +34,7 @@ CRITIC_HIDDEN2_DIM = 32
 ACTOR_HIDDEN1_DIM = 128
 ACTOR_HIDDEN2_DIM = 64
 
-N_TD_STEPS = 1 # Number of steps aggregated per experience (n in n-step TD)
+N_TD_STEPS = 1 # Number of steps aggregated per experience, not useful with PPO since we use GAE
 N_ROLLOUT_STEPS = 128 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS = 2048
 
 GAMMA = 0.99  # Good for MountainCarContinuous episodes (~200 steps)
@@ -122,12 +122,12 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
         old_logproba_v, _, _, old_values_v = net(states_v)
         old_values_v = old_values_v.squeeze(-1)
         
-        # Compute advantages using the old value estimates
-        advantages_v = target_returns_v - old_values_v
+        # Use GAE advantages directly - they're already properly calculated with GAE
+        # No need to recompute with simple TD method (returns - values)
         
         # Normalize advantages (standard practice for PPO/A2C)
         # This helps with training stability and convergence
-        adv_std = max(1e-3, advantages_v.std(unbiased=False) + 1e-8)
+        adv_std = max(1e-3, (advantages_v.std(unbiased=False) + 1e-8).item())
         advantages_v = (advantages_v - advantages_v.mean()) / adv_std
     
     return PPOBatch(
