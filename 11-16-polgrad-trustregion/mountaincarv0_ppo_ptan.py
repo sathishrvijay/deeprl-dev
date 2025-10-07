@@ -38,29 +38,31 @@ N_TD_STEPS = 1 # Number of steps aggregated per experience, not useful with PPO 
 N_ROLLOUT_STEPS = 128 # formal rollout definition; batch_size = N_ENVS * N_ROLLOUT_STEPS = 2048
 
 GAMMA = 0.99  # Good for MountainCarContinuous episodes (~200 steps)
-# Balanced learning rates for PPO - critic and actor should be similar
-CRITIC_LR_START = 1e-6  # Reduced from 7e-4 for better stability
-CRITIC_LR_END = 5e-7    # Proportionally reduced
-ACTOR_LR_START = 3e-6
-ACTOR_LR_END = 7e-7
+
+# Learning rates for PPO - Standard values for continuous control
+# PPO is robust to learning rates due to clipping, so we can use reasonable values
+CRITIC_LR_START = 3e-4  # Standard Adam LR for continuous control
+CRITIC_LR_END = 1e-5    # Decay to small value for fine-tuning
+ACTOR_LR_START = 1e-4   # Lower actor LR for stability
+ACTOR_LR_END = 1e-5     # Proportional decay
 LR_DECAY_FRAMES = 5e7
 
 # PG related - adjusted for continuous actions
-ENTROPY_BONUS_BETA_START = 3e-3  # Higher initial exploration
+ENTROPY_BONUS_BETA_START = 1e-3  # Moderate initial exploration (reduced from 3e-3)
 ENTROPY_BONUS_BETA_END = 1e-5    # Lower final exploration
-ENTROPY_DECAY_FRAMES = 1e7       # Extended from 1e6 to 1e7 for longer exploration period
-CLIP_GRAD = 0.3   # typical values of clipping the L2 norm is 0.1 to 1.0
+ENTROPY_DECAY_FRAMES = 1e7       # Extended decay period for gradual exploration reduction
+CLIP_GRAD = 0.5   # Slightly higher for better gradient flow with higher LR
 
 # MountainCarContinuous success threshold (one time +100 bonus for climbing the hill w/ small energy penalty otherwise)
 SOLVED_REWARD = 90.0  
 
-# PPO specific hyperparameters - OPTIMIZED FOR EFFICIENCY
+# PPO specific hyperparameters - Standard PPO configuration
 MAX_TRAINING_FRAMES = 5e7
-MINIBATCH_SIZE = 256                # Increased from 64 for better efficiency (8 minibatches instead of 32)
-MAX_EPOCHS_PER_BATCH = 4            # REDUCED from 256 to 4 - standard PPO range
+MINIBATCH_SIZE = 256                # 8 minibatches per full batch (2048 / 256)
+MAX_EPOCHS_PER_BATCH = 10           # Increased to 10 for better sample efficiency (standard: 10-15)
 GAE_LAMBDA = 0.95                   # GAE lambda parameter for advantage estimation (0.9-0.99 typical)
-PPO_CLIP_EPSILON = 0.2              # PPO clipping parameter - now parameterized instead of hardcoded
-PPO_TARGET_KL = 0.015               # Target KL divergence for early stopping (standard: 0.01-0.02)
+PPO_CLIP_EPSILON = 0.2              # PPO clipping parameter (standard: 0.1-0.3)
+PPO_TARGET_KL = 0.02                # Slightly relaxed target KL (standard: 0.015-0.03)
 
 
 @dataclass
@@ -129,8 +131,10 @@ def prepare_ppo_batch(batch: tt.List[ptan.experience.ExperienceFirstLast], net: 
     # This is crucial for PPO - we need the log probabilities, distribution parameters (mu, logvar),
     # and values from the policy that was used to collect the experiences
     with torch.no_grad():
-        old_logproba_v, old_mu_v, old_logvar_v, old_values_v = net(states_v)
+        _, old_mu_v, old_logvar_v, old_values_v = net(states_v)
         old_values_v = old_values_v.squeeze(-1)
+        # Evaluate log π_old(a|s) on the batch actions (squashed in [-1, 1])
+        old_logproba_v = net.compute_logproba(actions_v, old_mu_v, old_logvar_v, squashed=True)
         
         # Normalize GAE advantages (standard practice for PPO/A2C)
         # This helps with training stability and convergence
@@ -171,8 +175,8 @@ def core_training_loop(
     actor_optimizer.zero_grad()
     critic_optimizer.zero_grad()
 
-    # Get current policy outputs for the minibatch
-    logproba_actions_v, actions_mu_v, actions_logvar_v, values_v = net(minibatch.states_v)
+    # Get current policy outputs (distribution params) for the minibatch
+    _, actions_mu_v, actions_logvar_v, values_v = net(minibatch.states_v)
     values_v = values_v.squeeze(-1)
 
     # Compute current entropy bonus with decay
@@ -182,6 +186,8 @@ def core_training_loop(
     # Critic loss - same as A2C
     critic_loss_v = nn.functional.mse_loss(values_v, minibatch.target_returns_v)
 
+    # Compute log π_new(a|s) evaluated on the batch actions (squashed)
+    logproba_actions_v = net.compute_logproba(minibatch.actions_v, actions_mu_v, actions_logvar_v, squashed=True)
     # Compute importance sampling ratio (per minibatch observation)
     ratios = torch.exp(logproba_actions_v - minibatch.old_logprobas_v)
     
@@ -211,11 +217,23 @@ def core_training_loop(
     entropy_v = entropy_v.sum(dim=-1).mean()  # Sum over action dims, mean over batch
     entropy_bonus_v = current_entropy_beta * entropy_v
 
-    # Variance regularization to prevent excessive exploration (reduced penalty)
+    # Variance regularization to prevent excessive exploration
     var_penalty_v = 1e-5 * torch.exp(actions_logvar_v).mean()
     
-    # Action regularization to prevent extreme actions outside reasonable bounds [-0.8, 0.8]
-    action_reg_v = 1e-4 * torch.clamp(actions_mu_v.abs() - 0.8, min=0.0).mean()
+    # CRITICAL: Strong mean regularization to prevent action mean explosion
+    # Penalize means that drift far from 0 (since actions will be tanh-squashed)
+    # Quadratic penalty: heavily penalize large means to keep them in reasonable range
+    mean_penalty_v = 1e-3 * (actions_mu_v.pow(2)).mean()
+
+    # Debug - check policy statistics BEFORE optimization (using values computed above)
+    if debug and iter_no is not None and iter_no % 100 == 0:
+        with torch.no_grad():
+            mean_action = actions_mu_v.mean(dim=0).cpu().numpy()
+            std_action = torch.exp(actions_logvar_v / 2).mean(dim=0).cpu().numpy()
+            mean_ratio = ratios.mean().item()
+            print(f"Action μ={mean_action[0]:.3f}, σ={std_action[0]:.3f}, "
+                  f"ratio={mean_ratio:.3f}, kl={kl_divergence:.4f}, "
+                  f"entropy_β={current_entropy_beta:.4e}")
 
     # Separate loss computation and backpropagation
     # Critic loss (only affects critic network)
@@ -225,7 +243,7 @@ def core_training_loop(
     critic_scheduler.step()
 
     # Actor loss (only affects actor network)
-    actor_loss_v = pg_loss_v - entropy_bonus_v + var_penalty_v + action_reg_v
+    actor_loss_v = pg_loss_v - entropy_bonus_v + var_penalty_v + mean_penalty_v
     actor_loss_v.backward()
     torch.nn.utils.clip_grad_norm_(net.get_actor_parameters(), CLIP_GRAD)
     actor_optimizer.step()
@@ -233,16 +251,6 @@ def core_training_loop(
 
     # Total loss for logging (not used for backprop)
     total_loss_v = critic_loss_v + actor_loss_v
-
-    # Debug - check policy statistics
-    if debug and iter_no is not None and iter_no % 100 == 0:
-        with torch.no_grad():
-            mean_action = actions_mu_v.mean(dim=0).cpu().numpy()
-            std_action = torch.exp(actions_logvar_v / 2).mean(dim=0).cpu().numpy()
-            mean_ratio = ratios.mean().item()
-            print(f"Action μ={mean_action[0]:.3f}, σ={std_action[0]:.3f}, "
-                  f"ratio={mean_ratio:.3f}, kl={kl_divergence:.4f}, "
-                  f"entropy_β={current_entropy_beta:.4e}")
 
     # Return loss components for tracking
     return {
@@ -253,7 +261,7 @@ def core_training_loop(
         'entropy_raw': entropy_v.item(),
         'entropy_loss': entropy_bonus_v.item(),
         'var_penalty': var_penalty_v.item(),
-        'action_reg': action_reg_v.item(),
+        'mean_penalty': mean_penalty_v.item(),
         'current_entropy_beta': current_entropy_beta,
         'kl_divergence': kl_divergence,
         'mean_ratio': ratios.mean().item(),
@@ -387,17 +395,17 @@ if __name__ == "__main__":
         # Prepare structured batch data for PPO training
         ppo_batch = prepare_ppo_batch(batch, net)
         
-        # Perform multiple epochs of training per batch (now much more reasonable: 4 epochs instead of 256)
+        # Perform multiple epochs of training per batch
         num_epochs_per_batch = 0
         # Initialize with fallback values to ensure loss_dict is never None
         loss_dict = {
             'total_loss': 0.0, 'critic_loss': 0.0, 'actor_loss': 0.0, 'pg_loss': 0.0,
-            'entropy_raw': 0.0, 'entropy_loss': 0.0, 'var_penalty': 0.0, 'action_reg': 0.0,
+            'entropy_raw': 0.0, 'entropy_loss': 0.0, 'var_penalty': 0.0, 'mean_penalty': 0.0,
             'current_entropy_beta': 0.0, 'kl_divergence': 0.0, 'mean_ratio': 1.0, 'ratio_clipped_fraction': 0.0
         }
         
         for epoch in range(MAX_EPOCHS_PER_BATCH):
-            # Sample a random minibatch from the structured batch data (now 256 instead of 64)
+            # Sample a random minibatch from the structured batch data
             minibatch = ppo_batch.sample_minibatch(MINIBATCH_SIZE)
             
             # Training step with PPO minibatch - overwrites loss_dict
@@ -452,7 +460,7 @@ if __name__ == "__main__":
                 f"entropy_raw={loss_dict['entropy_raw']:.4f}, "
                 f"entropy_bonus={loss_dict['entropy_loss']:.4e}, "
                 f"var_penalty={loss_dict['var_penalty']:.4e}, "
-                f"action_reg={loss_dict['action_reg']:.4e}, "
+                f"mean_penalty={loss_dict['mean_penalty']:.4e}, "
                 f"kl_div={loss_dict['kl_divergence']:.4f}, "
                 f"mean_ratio={loss_dict['mean_ratio']:.3f}, "
                 f"clipped_frac={loss_dict['ratio_clipped_fraction']:.3f}, "
