@@ -280,26 +280,33 @@ class SAC(nn.Module):
                 actions = torch.tanh(raw_actions) * 2.0
                 return actions
 
-    def compute_logproba_raw_actions(self, raw_actions, actions_mu, actions_logvar):
-        """Compute log probabilities for raw actions with stable Jacobian correction
-        This avoids the numerical instability of atanh() by working directly with raw actions"""
-        
-        # Gaussian log probability for raw actions
+    def compute_logproba(self, actions: torch.Tensor, actions_mu: torch.Tensor, actions_logvar: torch.Tensor,
+                         squashed: bool, action_scale: float = 2.0):
+        """Compute log π(a|s) for raw or squashed actions.
+        - If squashed=True, `actions` are in [-action_scale, action_scale]; we atanh-unsquash and add Jacobian log(action_scale) + log(1 - tanh(u)^2).
+        - If squashed=False, `actions` are raw (pre-tanh) and no Jacobian is added.
+        """
+        if squashed:
+            eps = 1e-6
+            scaled = (actions / action_scale).clamp(-1 + eps, 1 - eps)
+            raw_actions = torch.atanh(scaled)
+        else:
+            raw_actions = actions
+
+        # Gaussian log prob in raw space
         log_proba_raw = -0.5 * (
             torch.log(torch.tensor(2 * math.pi)) +
             actions_logvar +
             (raw_actions - actions_mu).pow(2) / torch.exp(actions_logvar)
         )
-        
-        # Stable Jacobian correction for tanh squashing
-        # d/du[tanh(u) * 2] = 2 * (1 - tanh^2(u))
-        # log|J| = log(2 * (1 - tanh^2(u)))
-        tanh_raw = torch.tanh(raw_actions)
-        jacobian_correction = torch.log(2 * (1 - tanh_raw.pow(2)) + 1e-6)
-        
-        # Sum over action dimensions and apply correction
-        log_proba_squashed = (log_proba_raw + jacobian_correction).sum(dim=-1)
-        return log_proba_squashed
+
+        if squashed:
+            jacobian_correction = math.log(action_scale) + torch.log(1 - torch.tanh(raw_actions).pow(2) + 1e-6)
+            log_proba = log_proba_raw + jacobian_correction
+        else:
+            log_proba = log_proba_raw
+
+        return log_proba.sum(dim=-1)
 
     def forward(self, x: torch.Tensor):
         # Sample raw actions once and keep reference (stable approach)
@@ -315,8 +322,10 @@ class SAC(nn.Module):
         qvalue_1 = self.critic_1(x, squashed_actions)
         qvalue_2 = self.critic_2(x, squashed_actions)
 
-        # Compute log probabilities using raw actions (stable, no atanh)
-        logproba_actions = self.compute_logproba_raw_actions(raw_actions, actions_mu, actions_logvar)
+        # Compute log probabilities via raw path (avoid tanh->atanh no-op) and add Jacobian for tanh+scale
+        logproba_raw = self.compute_logproba(raw_actions, actions_mu, actions_logvar, squashed=False)
+        jacobian = math.log(2.0) + torch.log(1 - torch.tanh(raw_actions).pow(2) + 1e-6)
+        logproba_actions = logproba_raw + jacobian.sum(dim=-1)
         return logproba_actions, qvalue_1, qvalue_2
 
     def get_critic_net(self, critic_id: int = 1):

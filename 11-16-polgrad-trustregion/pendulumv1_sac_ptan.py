@@ -148,7 +148,9 @@ def core_training_loop(
     # In SAC, w/ 2 critics, first critic is used for actor loss
     # Sample action from Actor w/ reparametrization trick for differentiability
     actor_optimizer.zero_grad()
-    critic_params = list(tgt_net.model.get_critic_parameters(critic_id=1))
+    # Freeze both critics during actor update to prevent accumulating grads into critics
+    critic_params = list(tgt_net.model.get_critic_parameters(critic_id=1)) + \
+                    list(tgt_net.model.get_critic_parameters(critic_id=2))
     for p in critic_params:
         p.requires_grad_(False)
 
@@ -174,7 +176,7 @@ def core_training_loop(
     alpha_loss.backward()
     alpha_optimizer.step()
 
-    # unfreeze critic
+    # Unfreeze both critics after actor/alpha updates
     for p in critic_params:
         p.requires_grad_(True)
 
